@@ -1,0 +1,8 @@
+# Cross-compat regen temp files. The committed compressed fixture is
+# image.ntfs.gz; the uncompressed working copy is ignored.
+testdata/mkntfs/image.ntfs
+testdata/mkntfs/*.tmp
+
+# Test coverage output.
+coverage.out
+cover.out

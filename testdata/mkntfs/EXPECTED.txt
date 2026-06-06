@@ -1,0 +1,29 @@
+# Cross-compat fixture for the ntfs-3g `mkntfs` reference tool.
+#
+# Contract: a small NTFS image (~200 KiB, 20 MiB minimum image size required
+# by mkntfs is rounded down for fixture economy via -s 512 -c 512 small-volume
+# flags; see regen.sh) populated with two known files:
+#
+#   /hello.txt       -> contents "hello\n"
+#                       size:  6
+#                       md5:   b1946ac92492d2347c6235b4d2611184
+#
+#   /sub/blob.bin    -> 1024 bytes of deterministic random data (seed 1)
+#                       size:  1024
+#                       md5:   <computed by regen.sh and written here>
+#
+# Layout: image.ntfs.gz (gzip-compressed raw NTFS image). The test
+# decompresses to a temp file, opens the image via this package's
+# Open(), and asserts the two paths above exist with the expected size +
+# md5. Loader: TestReadMkntfsImage in ntfs_compat_test.go.
+#
+# Regeneration: see regen.sh. Requires `mkntfs` (Linux ntfs-3g/ntfsprogs)
+# or `mkntfs` on macOS from the `ntfs-3g` homebrew/pkgx package. When the
+# tool is on PATH the test will regenerate the image in-place and verify
+# the regenerated image matches as well — both committed and freshly
+# generated paths are exercised.
+#
+# Format (parsed by ntfs_compat_test.go):
+#   <path><TAB><size-in-bytes><TAB><md5-hex>
+/hello.txt	6	b1946ac92492d2347c6235b4d2611184
+/sub/blob.bin	1024	070f903e3b6ad4f35a82f4827587c74f
