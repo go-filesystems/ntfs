@@ -327,10 +327,12 @@ func (fs *ntfsFS) saveIndex() error {
 		if _, ok := fs.meta[k]; !ok {
 			fs.ensureMetaForPath(k)
 		}
-		// keep the mode/size/inode up to date for files
+		// keep the mode/size/inode up to date for files: ensure the
+		// regular-file type bits (S_IFREG = 0o100000) are set while
+		// preserving any custom permission bits the caller installed.
 		me := fs.meta[k]
 		if !v.IsDir {
-			me.Mode = me.Mode
+			me.Mode = (me.Mode &^ 0o170000) | 0o100000
 		}
 		fs.meta[k] = me
 	}
