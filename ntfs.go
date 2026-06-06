@@ -751,11 +751,24 @@ func (fs *ntfsFS) WriteFile(p string, data []byte, perm os.FileMode) error {
 		}
 	}
 	if !allocated {
-		// allocate at end
+		// allocate at end of the live region. The live region is
+		// the max of any indexed file's tail AND any free-list
+		// extent's tail: a free extent that lies past the highest
+		// indexed file would otherwise be silently overwritten by
+		// the new allocation, and a later best-fit allocation from
+		// that same free extent would then collide with us. By
+		// taking the max across both sets we guarantee the new
+		// allocation lands beyond every byte the allocator might
+		// hand out later.
 		var end uint64 = 0
 		for _, v := range fs.index {
 			if v.Offset+v.Size > end {
 				end = v.Offset + v.Size
+			}
+		}
+		for _, fe := range fs.freeList {
+			if fe.Offset+fe.Size > end {
+				end = fe.Offset + fe.Size
 			}
 		}
 		off = end
