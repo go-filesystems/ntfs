@@ -69,9 +69,15 @@ var (
 
 // FS is the public interface returned by Open. It extends
 // filesystem.Filesystem with NTFS-specific operations
-// (fragmentation analysis + compaction). Callers that only need
-// the generic interface can use it directly; callers that want
-// the extras type-assert (or accept *FS via Open's return type).
+// (fragmentation analysis, compaction and NTFSIMG1 image resize).
+// Callers that only need the generic interface can use it directly;
+// callers that want the extras type-assert (or accept *FS via Open's
+// return type).
+//
+// NOTE: Grow / Shrink / Resize operate on the NTFSIMG1 image format
+// this driver implements, NOT on real NTFS. Resizing a real NTFS
+// volume would require manipulating the MFT, $Bitmap and runlists and
+// is a separate, much larger project.
 type FS interface {
 	filesystem.Filesystem
 	FragmentationStats() (files int, used uint64, freeExtents int, totalFree uint64, largestFree uint64)
@@ -80,6 +86,9 @@ type FS interface {
 	Symlink(target, linkPath string) error
 	Label() string
 	SetLabel(label string) error
+	Grow(newSizeBytes int64) error
+	Shrink(newSizeBytes int64) error
+	Resize(newSizeBytes int64) error
 }
 
 var _ FS = (*ntfsFS)(nil)

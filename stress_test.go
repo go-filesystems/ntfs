@@ -539,7 +539,136 @@ func FuzzOpen(f *testing.F) {
 	})
 }
 
-// ---- 6. fault injection ----------------------------------------------------
+// ---- 6. resize stress ------------------------------------------------------
+
+// TestStressResizeCycle pairs the Grow/Shrink resize machinery with
+// the same write/read/delete churn that the end-of-data corruption
+// fix targeted. The regression it's most directly guarding against:
+// the allocator extending the live region into bytes that are about
+// to be exposed (after grow) or truncated away (after shrink). If
+// either Grow or Shrink leaves the free-list inconsistent with the
+// on-disk content region, the subsequent checksum verifications
+// (or post-reopen reads) will fail.
+func TestStressResizeCycle(t *testing.T) {
+	dir := t.TempDir()
+	img := filepath.Join(dir, "resize-stress.img")
+	fs, err := Open(img, 0)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+
+	rng := rand.New(rand.NewSource(99))
+	sums := map[string][32]byte{}
+	const maxLive = 8 // stays well below the header-overflow ceiling
+
+	writeOne := func(p string, sz int) {
+		data := make([]byte, sz)
+		rng.Read(data)
+		if err := fs.WriteFile(p, data, 0o644); err != nil {
+			if isHeaderOverflow(err) {
+				return
+			}
+			t.Fatalf("WriteFile %s: %v", p, err)
+		}
+		sums[p] = sha256.Sum256(data)
+	}
+
+	verify := func(stage string) {
+		for p, want := range sums {
+			got, err := fs.ReadFile(p)
+			if err != nil {
+				t.Fatalf("%s: ReadFile %s: %v", stage, p, err)
+			}
+			if sha256.Sum256(got) != want {
+				t.Fatalf("%s: sha256 mismatch on %s", stage, p)
+			}
+		}
+	}
+
+	// Seed.
+	for i := 0; i < maxLive; i++ {
+		writeOne(fmt.Sprintf("/s%d.bin", i), 256+rng.Intn(2048))
+	}
+	verify("seed")
+
+	// Cycle through several grow/shrink targets, churning between
+	// each step.
+	sizes := []int64{
+		int64(headerSize) + 1<<20,
+		int64(headerSize) + 256<<10,
+		int64(headerSize) + 4<<20,
+		int64(headerSize) + 128<<10,
+		int64(headerSize) + 2<<20,
+	}
+	for i, target := range sizes {
+		st, err := os.Stat(img)
+		if err != nil {
+			t.Fatalf("stat: %v", err)
+		}
+		switch {
+		case target > st.Size():
+			if err := fs.Grow(target); err != nil {
+				t.Fatalf("round %d Grow(%d): %v", i, target, err)
+			}
+		case target < st.Size():
+			if err := fs.Shrink(target); err != nil {
+				t.Fatalf("round %d Shrink(%d): %v", i, target, err)
+			}
+		}
+		// Churn: random write/overwrite/delete, then verify.
+		for j := 0; j < 8; j++ {
+			op := rng.Intn(10)
+			name := fmt.Sprintf("/r%d/n%d.bin", i, rng.Intn(maxLive))
+			switch {
+			case op < 6:
+				if len(sums) >= maxLive*2 {
+					for victim := range sums {
+						_ = fs.DeleteFile(victim)
+						delete(sums, victim)
+						break
+					}
+				}
+				writeOne(name, 128+rng.Intn(4096))
+			case op < 9:
+				// Read a known file if any.
+				for p := range sums {
+					if _, err := fs.ReadFile(p); err != nil {
+						t.Fatalf("round %d read %s: %v", i, p, err)
+					}
+					break
+				}
+			default:
+				for victim := range sums {
+					_ = fs.DeleteFile(victim)
+					delete(sums, victim)
+					break
+				}
+			}
+		}
+		verify(fmt.Sprintf("round %d", i))
+	}
+
+	// Round-trip: close, reopen, every committed file still matches.
+	if err := fs.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	fs2, err := Open(img, 0)
+	if err != nil {
+		t.Fatalf("re-Open: %v", err)
+	}
+	defer fs2.Close()
+	for p, want := range sums {
+		got, err := fs2.ReadFile(p)
+		if err != nil {
+			t.Fatalf("post-reopen ReadFile %s: %v", p, err)
+		}
+		if sha256.Sum256(got) != want {
+			t.Fatalf("post-reopen sha256 mismatch on %s", p)
+		}
+	}
+}
+
+// ---- 7. fault injection ----------------------------------------------------
 
 // faultRW wraps a real diskRW and returns the configured error on the
 // next ReadAt or WriteAt past the trigger offset. It lives in the
