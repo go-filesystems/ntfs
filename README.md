@@ -21,6 +21,7 @@ Implementation details:
 | MkDir / Delete / Rename | ✅ | Implemented (recursive delete supported) |
 | ReadLink / Symlinks | ⚠️ No | No NTFS alternate data streams or full symlink support |
 | Free-list reuse | ✅ | In-image free-list and reuse implemented |
+| Volume label | ✅ | `Label` / `SetLabel` (filesystem.Labeller) |
 
 Notes on current capabilities:
 
