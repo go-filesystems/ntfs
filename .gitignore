@@ -6,3 +6,6 @@ testdata/mkntfs/*.tmp
 # Test coverage output.
 coverage.out
 cover.out
+
+# Cross-compiled per-package test binaries built by the emulated CI matrix.
+.qemu-tests/
