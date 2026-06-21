@@ -1,4 +1,10 @@
+<p align="center"><img src="https://raw.githubusercontent.com/go-filesystems/brand/main/social/go-filesystems-ntfs.png" alt="go-filesystems/ntfs" width="720"></p>
+
 # ntfs package
+
+[![Go Reference](https://pkg.go.dev/badge/github.com/go-filesystems/ntfs.svg)](https://pkg.go.dev/github.com/go-filesystems/ntfs)
+[![License: BSD-3-Clause](https://img.shields.io/badge/License-BSD%203--Clause-blue.svg)](https://opensource.org/licenses/BSD-3-Clause)
+[![CI](https://github.com/go-filesystems/ntfs/actions/workflows/ci.yml/badge.svg)](https://github.com/go-filesystems/ntfs/actions/workflows/ci.yml)
 
 This package provides a minimal NTFS driver that implements the
 `filesystem.Filesystem` interface.
