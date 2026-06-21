@@ -2,11 +2,14 @@ package filesystem_ntfs
 
 // Stress-test suite for the in-image NTFSIMG1 driver.
 //
-// All heavy work is gated behind testing.Short() and the NTFS_STRESS_*
-// environment variables documented at the top of each test. A plain
-// `go test ./...` (which sets short by default in this repo) runs the
-// short configuration in < 30 seconds total. The long configuration is
-// reached with `go test -run Stress -timeout 30m` plus the env vars.
+// Heavy work is opt-in. A plain `go test ./...` (which does NOT pass
+// -short, and does NOT set it for us) runs the bounded "short"
+// configuration in well under a minute total. The multi-hour long
+// configuration is reached explicitly via NTFS_STRESS_LONG=1 (or by
+// setting the specific NTFS_STRESS_* / -stress.* knobs), together with a
+// matching `-timeout`. This keeps the default test run from blocking for
+// hours, which is what happened when "non-short" alone selected the long
+// defaults.
 //
 // IMPORTANT: this driver uses a custom "NTFSIMG1" on-disk format, NOT
 // real NTFS. The stress tests target the format the lib actually
@@ -34,9 +37,9 @@ import (
 
 var (
 	stressWorkers  = flag.Int("stress.workers", 8, "concurrent R/W workers for TestStressConcurrentRW")
-	stressDuration = flag.Duration("stress.duration", 0, "duration for TestStressConcurrentRW; 0 = pick default based on -short")
-	stressFileMB   = flag.Int("stress.file-mb", 0, "size in MiB for TestStressLargeFile; 0 = pick default based on -short")
-	stressFiles    = flag.Int("stress.files", 0, "file count for TestStressManyFiles; 0 = pick default based on -short")
+	stressDuration = flag.Duration("stress.duration", 0, "duration for TestStressConcurrentRW; 0 = bounded default unless NTFS_STRESS_LONG=1")
+	stressFileMB   = flag.Int("stress.file-mb", 0, "size in MiB for TestStressLargeFile; 0 = bounded default unless NTFS_STRESS_LONG=1")
+	stressFiles    = flag.Int("stress.files", 0, "file count for TestStressManyFiles; 0 = bounded default unless NTFS_STRESS_LONG=1")
 )
 
 // envOr returns the parsed value of env var name, falling back to def on
@@ -60,44 +63,54 @@ func envOrInt(name string, def int) (int, bool) {
 	return def, false
 }
 
+// longMode reports whether the multi-hour/large stress configuration has been
+// explicitly requested. Without it (the default for a plain `go test ./...`,
+// even though that is not -short), the resolvers below pick the bounded values
+// so the suite finishes in seconds instead of blocking for hours.
+func longMode() bool { return os.Getenv("NTFS_STRESS_LONG") != "" }
+
 // resolveDuration picks the active duration in this order:
 //  1. -stress.duration if non-zero
 //  2. NTFS_STRESS_DURATION if set
-//  3. short / long defaults
+//  3. long default only when -short is off AND long mode is opted in
+//  4. otherwise the bounded short default
 func resolveDuration(short bool) time.Duration {
 	if *stressDuration > 0 {
 		return *stressDuration
 	}
-	def := 3 * time.Hour
-	if short {
-		def = 3 * time.Second
+	if d, ok := envOrDuration("NTFS_STRESS_DURATION", 0); ok {
+		return d
 	}
-	d, _ := envOrDuration("NTFS_STRESS_DURATION", def)
-	return d
+	if !short && longMode() {
+		return 3 * time.Hour
+	}
+	return 3 * time.Second
 }
 
 func resolveFileMB(short bool) int {
 	if *stressFileMB > 0 {
 		return *stressFileMB
 	}
-	def := 4096 // 4 GiB long
-	if short {
-		def = 64
+	if v, ok := envOrInt("NTFS_STRESS_FILE_MB", 0); ok {
+		return v
 	}
-	v, _ := envOrInt("NTFS_STRESS_FILE_MB", def)
-	return v
+	if !short && longMode() {
+		return 4096 // 4 GiB long
+	}
+	return 64
 }
 
 func resolveFiles(short bool) int {
 	if *stressFiles > 0 {
 		return *stressFiles
 	}
-	def := 1_000_000
-	if short {
-		def = 5_000
+	if v, ok := envOrInt("NTFS_STRESS_FILES", 0); ok {
+		return v
 	}
-	v, _ := envOrInt("NTFS_STRESS_FILES", def)
-	return v
+	if !short && longMode() {
+		return 1_000_000
+	}
+	return 5_000
 }
 
 func resolveWorkers() int {
@@ -511,7 +524,7 @@ func FuzzOpen(f *testing.F) {
 	// A handful of degenerate seeds that have triggered parser bugs
 	// in similar codebases.
 	f.Add([]byte{})
-	f.Add([]byte("NTFSIMG1"))                                              // magic only
+	f.Add([]byte("NTFSIMG1"))                                                      // magic only
 	f.Add(append([]byte("NTFSIMG1"), make([]byte, headerSize-len("NTFSIMG1"))...)) // magic+zeros
 
 	f.Fuzz(func(t *testing.T, data []byte) {
