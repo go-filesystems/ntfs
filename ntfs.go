@@ -103,6 +103,17 @@ func Open(imagePath string, partIndex int) (FS, error) {
 	}
 	// underlying *os.File implements ReaderAt/WriterAt/Closer
 	f := diskRW(f0)
+	// Route genuine NTFS volumes (OEM id "NTFS    " + 0xAA55 boot
+	// signature) to the read-only real-NTFS reader; the legacy NTFSIMG1
+	// mock format keeps the original code path below.
+	if looksLikeRealNTFS(f, 0) {
+		rfs, err := openRealNTFS(f, 0)
+		if err != nil {
+			f.Close()
+			return nil, err
+		}
+		return rfs, nil
+	}
 	fs := &ntfsFS{f: f, partOffset: 0, index: map[string]fileEntry{}}
 	if err := fs.loadIndex(); err != nil {
 		f.Close()
