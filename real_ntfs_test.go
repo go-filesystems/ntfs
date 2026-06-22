@@ -270,8 +270,10 @@ func appendLE(b []byte, v uint64, n int) []byte {
 	return b
 }
 
-// buildSyntheticNTFS writes a minimal real-NTFS image to path.
-func buildSyntheticNTFS(t *testing.T, path string) {
+// buildSyntheticNTFS writes a minimal real-NTFS image to path. It accepts
+// testing.TB so both unit tests (*testing.T) and the fuzz seed builder
+// (*testing.F) can call it.
+func buildSyntheticNTFS(t testing.TB, path string) {
 	t.Helper()
 
 	// Image must be large enough to hold the boot sector, the MFT region

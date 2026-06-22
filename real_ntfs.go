@@ -32,12 +32,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"sort"
 	"strings"
 	"unicode/utf16"
 
 	filesystem "github.com/go-filesystems/interface"
+	"github.com/go-volumes/safeio"
 )
 
 const (
@@ -76,6 +78,32 @@ const (
 	// FILE record header flags.
 	fileRecordInUse     = 0x0001
 	fileRecordDirectory = 0x0002
+
+	// Hardening limits for untrusted images. NTFS records are tiny by
+	// spec; these ceilings reject malicious geometry before it reaches a
+	// make()/slice and turns into an OOM or an out-of-bounds panic.
+	//
+	// maxRecordSize caps a single MFT FILE record / INDX block. The NTFS
+	// spec allows 512B..64KiB; we allow up to 1 MiB of slack and reject
+	// anything larger (e.g. the ~2 GiB a signed-shift byte can produce).
+	maxRecordSize = 1 << 20 // 1 MiB
+	// maxDataSize caps the logical size of any non-resident attribute we
+	// will buffer in memory (e.g. a $DATA stream or an $INDEX_ALLOCATION).
+	// 1 GiB is far larger than any directory index or metadata stream this
+	// read-only foundation legitimately materialises, while still bounding
+	// a 2^63 realSize field to a graceful error.
+	maxDataSize = 1 << 30 // 1 GiB
+	// maxRunLengthClusters bounds the cluster count of a single data run so
+	// an 8-byte length field of 0x7FFF...FF cannot drive run arithmetic to
+	// overflow or a huge allocation. 2^40 clusters is a petabyte-scale
+	// ceiling that no legitimate run reaches.
+	maxRunLengthClusters = int64(1) << 40
+	// minBytesPerSector is the smallest sane sector size; NTFS uses 512 and
+	// up. Anything below this (notably 1, which makes sectorEnd-2 negative)
+	// is rejected. The boot field is a uint16 so the value is already
+	// bounded above by 64 KiB; we only need a floor plus a power-of-two
+	// requirement.
+	minBytesPerSector = 512
 )
 
 // realErrReadOnly is returned by every mutating method on the real-NTFS
@@ -161,8 +189,15 @@ func (r *realNTFS) parseBoot() error {
 	}
 	bps := uint32(binary.LittleEndian.Uint16(buf[0x0B:]))
 	spc := uint32(buf[0x0D])
-	if bps == 0 || spc == 0 {
+	if spc == 0 {
 		return fmt.Errorf("ntfs: invalid BPB (bytes/sector=%d sectors/cluster=%d)", bps, spc)
+	}
+	// H4: a bytes-per-sector value of 0 or 1 makes sectorEnd-2 negative in
+	// applyFixup; a non-power-of-two confuses sector arithmetic. Require a
+	// power of two in [512, 64KiB].
+	if !isPowerOfTwo(bps) || bps < minBytesPerSector {
+		return fmt.Errorf("ntfs: invalid bytes-per-sector %d (must be a power of two >= %d)",
+			bps, minBytesPerSector)
 	}
 	mftClus := binary.LittleEndian.Uint64(buf[0x30:])
 
@@ -173,12 +208,21 @@ func (r *realNTFS) parseBoot() error {
 	}
 	b.mftRecordSize = decodeClustersPerRecord(int8(buf[0x40]), b.clusterSize())
 	b.indexRecordSize = decodeClustersPerRecord(int8(buf[0x44]), b.clusterSize())
-	if b.mftRecordSize == 0 {
-		return fmt.Errorf("ntfs: invalid clusters-per-MFT-record")
+	// M1: clamp record sizes to a sane ceiling; a signed-shift byte can
+	// otherwise produce a ~2 GiB record size that OOMs the make() in
+	// readFileRecordAt / the INDX walk.
+	if b.mftRecordSize == 0 || b.mftRecordSize > maxRecordSize {
+		return fmt.Errorf("ntfs: invalid MFT record size %d", b.mftRecordSize)
+	}
+	if b.indexRecordSize > maxRecordSize {
+		return fmt.Errorf("ntfs: invalid index record size %d", b.indexRecordSize)
 	}
 	r.boot = b
 	return nil
 }
+
+// isPowerOfTwo reports whether v is a non-zero power of two.
+func isPowerOfTwo(v uint32) bool { return v != 0 && v&(v-1) == 0 }
 
 // decodeClustersPerRecord interprets the signed "clusters per record"
 // byte used for both MFT records (0x40) and index records (0x44). A
@@ -187,16 +231,40 @@ func (r *realNTFS) parseBoot() error {
 // cluster, e.g. -10 => 1024 bytes).
 func decodeClustersPerRecord(v int8, clusterSize int64) uint32 {
 	if v >= 0 {
-		return uint32(int64(v) * clusterSize)
+		// M1: positive cluster counts are bounded by the caller clamping
+		// the result to maxRecordSize, but guard the multiply against
+		// overflow so a huge clusterSize cannot wrap into a small value.
+		sz := int64(v) * clusterSize
+		if clusterSize != 0 && sz/clusterSize != int64(v) {
+			return 0 // overflow → rejected by the caller's size check
+		}
+		if sz < 0 || sz > math.MaxUint32 {
+			return 0
+		}
+		return uint32(sz)
 	}
-	return uint32(int64(1) << uint(-v))
+	// M2: a negative byte v means 2^(-v) bytes. Restrict the shift to
+	// [9,16] (512 B .. 64 KiB records); anything outside that range (e.g.
+	// -31 => 2 GiB) is rejected with a zero the caller treats as invalid.
+	shift := -int(v)
+	if shift < 9 || shift > 16 {
+		return 0
+	}
+	return uint32(int64(1) << uint(shift))
 }
 
 // loadMFTRuns reads MFT record 0 ($MFT) to recover its $DATA runlist so
 // the reader can locate any MFT record even on a fragmented volume. $MFT
 // record 0 is always at $MftClusterNumber and is self-describing.
 func (r *realNTFS) loadMFTRuns() error {
-	off := int64(r.boot.mftCluster)*r.boot.clusterSize() + r.partOffset
+	// A hostile $MftClusterNumber (e.g. 0xFFFF...FF) would make the byte
+	// offset negative or overflow; compute it with the same guards
+	// mftRecordOffset uses so a corrupt boot sector yields an error rather
+	// than a negative ReadAt offset (and a slice-bounds panic).
+	off, ok := r.mftRecordOffset(mftRecordMFT)
+	if !ok {
+		return fmt.Errorf("ntfs: $MFT record offset unreachable")
+	}
 	rec, err := r.readFileRecordAt(off)
 	if err != nil {
 		return fmt.Errorf("ntfs: read $MFT record: %w", err)
@@ -215,28 +283,93 @@ func (r *realNTFS) loadMFTRuns() error {
 // mftRecordOffset maps a record number to its absolute byte offset using
 // the $MFT runlist. Returns (offset, true) when the record is reachable.
 func (r *realNTFS) mftRecordOffset(recNo uint64) (int64, bool) {
-	// Bytes into the $MFT $DATA stream where this record begins.
-	target := int64(recNo) * int64(r.boot.mftRecordSize)
+	// Bytes into the $MFT $DATA stream where this record begins. recNo and
+	// mftRecordSize are both bounded (record size <= 1 MiB), but compute the
+	// product overflow-safely anyway.
+	target, ok := mulCheck(int64(recNo), int64(r.boot.mftRecordSize))
+	if !ok {
+		return 0, false
+	}
 	cs := r.boot.clusterSize()
 	// Special-case: before loadMFTRuns populates mftRuns we still need
-	// record 0; it sits at mftCluster.
+	// record 0; it sits at mftCluster. A hostile $MftClusterNumber must not
+	// produce a negative or overflowing byte offset.
 	if r.mftRuns == nil {
-		return int64(r.boot.mftCluster)*cs + target + r.partOffset, true
+		base, ok := mulCheck(int64(r.boot.mftCluster), cs)
+		if !ok || int64(r.boot.mftCluster) < 0 {
+			return 0, false
+		}
+		abs, ok := addCheck(base, target)
+		if !ok {
+			return 0, false
+		}
+		abs, ok = addCheck(abs, r.partOffset)
+		if !ok || abs < 0 {
+			return 0, false
+		}
+		return abs, true
 	}
 	var streamPos int64 // byte position of the start of the current run
 	for _, run := range r.mftRuns {
-		runBytes := run.lengthClusters * cs
-		if target < streamPos+runBytes {
+		// M4: overflow-safe run arithmetic. A malicious $MFT runlist could
+		// otherwise drive lengthClusters*cs or startCluster*cs negative and
+		// misdirect a record read.
+		runBytes, ok := mulCheck(run.lengthClusters, cs)
+		if !ok {
+			return 0, false
+		}
+		streamEnd, ok := addCheck(streamPos, runBytes)
+		if !ok {
+			return 0, false
+		}
+		if target < streamEnd {
 			if run.sparse {
 				return 0, false
 			}
 			within := target - streamPos
-			abs := run.startCluster*cs + within + r.partOffset
+			base, ok := mulCheck(run.startCluster, cs)
+			if !ok {
+				return 0, false
+			}
+			abs, ok := addCheck(base, within)
+			if !ok {
+				return 0, false
+			}
+			abs, ok = addCheck(abs, r.partOffset)
+			if !ok || abs < 0 {
+				return 0, false
+			}
 			return abs, true
 		}
-		streamPos += runBytes
+		streamPos = streamEnd
 	}
 	return 0, false
+}
+
+// mulCheck returns a*b and whether the product fit in int64 without
+// overflow (treating a*b as a non-negative byte count: a negative operand
+// or a wrapped result reports !ok).
+func mulCheck(a, b int64) (int64, bool) {
+	if a < 0 || b < 0 {
+		return 0, false
+	}
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	p := a * b
+	if p/b != a || p < 0 {
+		return 0, false
+	}
+	return p, true
+}
+
+// addCheck returns a+b and whether the sum fit in int64 without overflow.
+func addCheck(a, b int64) (int64, bool) {
+	s := a + b
+	if (b > 0 && s < a) || (b < 0 && s > a) {
+		return 0, false
+	}
+	return s, true
 }
 
 // ---- FILE record parsing ----
@@ -323,33 +456,47 @@ func (r *realNTFS) parseFileRecord(buf []byte) (*fileRecord, error) {
 // parseAttribute decodes one attribute record (header + body).
 func (r *realNTFS) parseAttribute(buf []byte) (attribute, error) {
 	var a attribute
+	// C1: the fixed-offset reads below (buf[8], buf[10:], buf[0x10:],
+	// buf[0x14:]) require a full resident attribute header. The caller only
+	// guarantees recLen>0, so a short attribute would panic without this.
+	if err := safeio.CheckBounds(0, 0x18, len(buf)); err != nil {
+		return a, fmt.Errorf("ntfs: short attribute header: %w", err)
+	}
 	a.typeCode = binary.LittleEndian.Uint32(buf[0:])
 	nonResident := buf[8]
 	nameLen := int(buf[9])
 	nameOff := int(binary.LittleEndian.Uint16(buf[10:]))
-	if nameLen > 0 && nameOff+nameLen*2 <= len(buf) {
-		a.name = decodeUTF16(buf[nameOff : nameOff+nameLen*2])
+	if nameLen > 0 {
+		if name, err := safeio.Slice(buf, nameOff, nameLen*2); err == nil {
+			a.name = decodeUTF16(name)
+		}
 	}
 	if nonResident == 0 {
 		// Resident attribute.
-		contentLen := binary.LittleEndian.Uint32(buf[0x10:])
-		contentOff := binary.LittleEndian.Uint16(buf[0x14:])
-		end := int(contentOff) + int(contentLen)
-		if int(contentOff) > len(buf) || end > len(buf) {
-			return a, fmt.Errorf("ntfs: resident attr content out of range")
+		contentLen := int(binary.LittleEndian.Uint32(buf[0x10:]))
+		contentOff := int(binary.LittleEndian.Uint16(buf[0x14:]))
+		content, err := safeio.Slice(buf, contentOff, contentLen)
+		if err != nil {
+			return a, fmt.Errorf("ntfs: resident attr content out of range: %w", err)
 		}
-		a.residentData = append([]byte(nil), buf[contentOff:end]...)
+		a.residentData = append([]byte(nil), content...)
 		a.realSize = uint64(contentLen)
 		return a, nil
 	}
-	// Non-resident attribute.
+	// Non-resident attribute. The runlist-offset (0x20) and real-size
+	// (0x30) fields live in the extended (non-resident) header, so require
+	// at least 0x40 bytes before reading them.
+	if err := safeio.CheckBounds(0, 0x40, len(buf)); err != nil {
+		return a, fmt.Errorf("ntfs: short non-resident attribute header: %w", err)
+	}
 	a.nonResident = true
 	a.realSize = binary.LittleEndian.Uint64(buf[0x30:])
 	runOff := int(binary.LittleEndian.Uint16(buf[0x20:]))
-	if runOff < 0 || runOff > len(buf) {
-		return a, fmt.Errorf("ntfs: bad runlist offset")
+	runData, err := safeio.Slice(buf, runOff, len(buf)-runOff)
+	if err != nil {
+		return a, fmt.Errorf("ntfs: bad runlist offset: %w", err)
 	}
-	runs, err := decodeRunList(buf[runOff:])
+	runs, err := decodeRunList(runData)
 	if err != nil {
 		return a, err
 	}
@@ -367,14 +514,18 @@ func applyFixup(buf []byte, usaOffset, usaCount uint16, bytesPerSector uint32) e
 		return nil
 	}
 	uo := int(usaOffset)
-	if uo+int(usaCount)*2 > len(buf) {
-		return fmt.Errorf("USA out of range")
+	if err := safeio.CheckBounds(uo, int(usaCount)*2, len(buf)); err != nil {
+		return fmt.Errorf("USA out of range: %w", err)
 	}
 	usn := buf[uo : uo+2]
 	sectors := int(usaCount) - 1
 	for i := 0; i < sectors; i++ {
 		sectorEnd := (i + 1) * int(bytesPerSector)
-		if sectorEnd > len(buf) {
+		// H4: a bytes-per-sector of 0/1 (or any sector ending before its
+		// own trailing word) makes sectorEnd-2 negative; reject it rather
+		// than panic. parseBoot already enforces bps>=512, but INDX blocks
+		// reach here through the same path so keep the guard local.
+		if sectorEnd < 2 || sectorEnd > len(buf) {
 			return fmt.Errorf("fixup sector %d beyond record", i)
 		}
 		tail := buf[sectorEnd-2 : sectorEnd]
@@ -397,7 +548,14 @@ func decodeRunList(buf []byte) ([]dataRun, error) {
 	var runs []dataRun
 	var prevLCN int64
 	i := 0
+	// A runlist cannot have more runs than it has bytes (each run is at
+	// least 2 bytes: a non-zero header + one length byte); bound the walk
+	// so a degenerate buffer cannot spin.
+	guard := safeio.NewLoopGuard(len(buf) + 1)
 	for i < len(buf) {
+		if err := guard.Next(); err != nil {
+			return nil, fmt.Errorf("ntfs: runlist: %w", err)
+		}
 		header := buf[i]
 		if header == 0 {
 			break
@@ -410,6 +568,12 @@ func decodeRunList(buf []byte) ([]dataRun, error) {
 		}
 		length := int64(readUintLE(buf[i : i+lenBytes]))
 		i += lenBytes
+		// H3: bound the cluster count so an 8-byte length of 0x7FFF...FF
+		// cannot feed H1/H2. A negative (top-bit-set) length is also
+		// rejected.
+		if length < 0 || length > maxRunLengthClusters {
+			return nil, fmt.Errorf("ntfs: data run length %d out of range", length)
+		}
 
 		run := dataRun{lengthClusters: length}
 		if offBytes == 0 {
@@ -419,6 +583,12 @@ func decodeRunList(buf []byte) ([]dataRun, error) {
 			delta := readIntLE(buf[i : i+offBytes])
 			i += offBytes
 			prevLCN += delta
+			// H3: a non-sparse run must reference a non-negative cluster;
+			// reject a runlist that decodes to a negative LCN so the
+			// startCluster*cs arithmetic downstream stays non-negative.
+			if prevLCN < 0 {
+				return nil, fmt.Errorf("ntfs: data run negative start cluster %d", prevLCN)
+			}
 			run.startCluster = prevLCN
 		}
 		runs = append(runs, run)
@@ -466,24 +636,62 @@ func decodeUTF16(b []byte) string {
 // readRuns reads logical bytes [0,size) from a runlist. Sparse runs
 // yield zeroes. Clusters are read relative to partOffset.
 func (r *realNTFS) readRuns(runs []dataRun, size uint64) ([]byte, error) {
-	out := make([]byte, size)
 	cs := r.boot.clusterSize()
+	// H1: bound the requested logical size by both the total capacity the
+	// runlist can actually back AND an absolute ceiling, so an attacker's
+	// uint64 realSize cannot OOM. Compute the runlist capacity with
+	// overflow-safe arithmetic (H2/H3 already bound each run length).
+	var capBytes int64
+	for _, run := range runs {
+		rb, ok := mulCheck(run.lengthClusters, cs)
+		if !ok {
+			return nil, fmt.Errorf("ntfs: run capacity overflow")
+		}
+		capBytes, ok = addCheck(capBytes, rb)
+		if !ok {
+			return nil, fmt.Errorf("ntfs: run capacity overflow")
+		}
+	}
+	// The output is at most the smaller of the declared size and the
+	// runlist capacity, and never more than maxDataSize.
+	if size > uint64(math.MaxInt64) {
+		return nil, fmt.Errorf("ntfs: data size %d too large", size)
+	}
+	want := int64(size)
+	if want > capBytes {
+		want = capBytes
+	}
+	out, err := safeio.MakeBytes(want, maxDataSize)
+	if err != nil {
+		return nil, fmt.Errorf("ntfs: data buffer: %w", err)
+	}
 	var pos int64 // logical byte position in the output
 	for _, run := range runs {
-		runBytes := run.lengthClusters * cs
-		if pos >= int64(size) {
+		if pos >= want {
 			break
 		}
+		// H2: overflow-safe runlist cluster math.
+		runBytes, ok := mulCheck(run.lengthClusters, cs)
+		if !ok {
+			return nil, fmt.Errorf("ntfs: run byte count overflow")
+		}
 		toCopy := runBytes
-		if pos+toCopy > int64(size) {
-			toCopy = int64(size) - pos
+		if pos+toCopy > want {
+			toCopy = want - pos
 		}
 		if run.sparse {
 			// leave zeroes
 			pos += toCopy
 			continue
 		}
-		abs := run.startCluster*cs + r.partOffset
+		base, ok := mulCheck(run.startCluster, cs)
+		if !ok {
+			return nil, fmt.Errorf("ntfs: run start overflow")
+		}
+		abs, ok := addCheck(base, r.partOffset)
+		if !ok || abs < 0 {
+			return nil, fmt.Errorf("ntfs: run absolute offset overflow")
+		}
 		if _, err := r.f.ReadAt(out[pos:pos+toCopy], abs); err != nil && err != io.EOF {
 			return nil, err
 		}
@@ -604,6 +812,13 @@ func (r *realNTFS) listDirRecord(fr *fileRecord) ([]indexEntry, error) {
 		if blkSize == 0 {
 			blkSize = 4096
 		}
+		// C5: the INDX header read below dereferences blk[0:4] (magic),
+		// blk[0x04:]/blk[0x06:] (USA words) and blk[0x18:]+4 (first-entry
+		// offset). A small indexRecordSize (e.g. 4 or 8) would make those
+		// reads OOB. Require a block large enough to hold the header.
+		if blkSize < 0x1C {
+			return entries, fmt.Errorf("ntfs: INDX block size %d too small", blkSize)
+		}
 		for off := 0; off+blkSize <= len(raw); off += blkSize {
 			blk := raw[off : off+blkSize]
 			if string(blk[0:4]) != "INDX" {
@@ -615,7 +830,8 @@ func (r *realNTFS) listDirRecord(fr *fileRecord) ([]indexEntry, error) {
 				return entries, fmt.Errorf("ntfs: INDX fixup: %w", err)
 			}
 			// INDX header: bytes 0x18 begin the INDEX_HEADER. Entry
-			// offsets are relative to 0x18.
+			// offsets are relative to 0x18 (the blkSize>=0x1C check above
+			// guarantees these four bytes are in range).
 			ih := blk[0x18:]
 			firstOff := binary.LittleEndian.Uint32(ih[0x00:])
 			blkEntries, err := parseIndexEntries(ih, int(firstOff))
