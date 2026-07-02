@@ -19,13 +19,17 @@ package filesystem_ntfs
 //     non-resident $DATA (0x80) including data-run (runlist) decoding.
 //   - Directory listing via $INDEX_ROOT (0x90) and $INDEX_ALLOCATION
 //     (0xA0) with the INDX block USA fixup.
-//   - ReadFile / ListDir / Stat wired to the above.
+//   - Symlink/junction target reads via the $REPARSE_POINT attribute
+//     (0xC0): ReadLink parses the REPARSE_DATA_BUFFER for the symlink
+//     (IO_REPARSE_TAG_SYMLINK) and mount-point (IO_REPARSE_TAG_MOUNT_POINT)
+//     tags and returns the target path.
+//   - ReadFile / ListDir / Stat / ReadLink wired to the above.
 //
 // What is intentionally NOT implemented here (the reader returns an
 // error or an empty result): any write path, $Bitmap accounting,
 // attribute lists ($ATTRIBUTE_LIST 0x20) that span multiple FILE
-// records, compressed/sparse/encrypted runs, reparse points, and named
-// data streams. These are documented as follow-up work.
+// records, compressed/sparse/encrypted runs, and named data streams.
+// These are documented as follow-up work.
 
 import (
 	"encoding/binary"
@@ -63,7 +67,28 @@ const (
 	attrData                = 0x80
 	attrIndexRoot           = 0x90
 	attrIndexAllocation     = 0xA0
+	attrReparsePoint        = 0xC0
 	attrEnd                 = 0xFFFFFFFF
+
+	// Reparse-point tags that name a path target. NTFS stores symbolic
+	// links and directory junctions (mount points) as a $REPARSE_POINT
+	// attribute (0xC0) whose body is a REPARSE_DATA_BUFFER opened by a
+	// 32-bit tag. Only these two tags carry a substitute/print name pair.
+	reparseTagSymlink    = 0xA000000C // IO_REPARSE_TAG_SYMLINK
+	reparseTagMountPoint = 0xA0000003 // IO_REPARSE_TAG_MOUNT_POINT
+
+	// reparseHeaderLen is the fixed REPARSE_DATA_BUFFER header: a 4-byte
+	// ReparseTag, a 2-byte ReparseDataLength and a 2-byte Reserved field.
+	reparseHeaderLen = 8
+
+	// symlinkPathBufOff / mountPointPathBufOff are the byte offsets of the
+	// PathBuffer within the tag-specific payload (i.e. after the 8-byte
+	// REPARSE_DATA_BUFFER header). A SymbolicLinkReparseBuffer has four
+	// 2-byte name offset/length fields (8 bytes) followed by a 4-byte Flags
+	// field before its PathBuffer; a MountPointReparseBuffer has the same
+	// four fields but no Flags word.
+	symlinkPathBufOff    = 12
+	mountPointPathBufOff = 8
 
 	// $FILE_NAME namespace values.
 	fileNameNamespacePOSIX  = 0
@@ -700,11 +725,12 @@ func (r *realNTFS) readRuns(runs []dataRun, size uint64) ([]byte, error) {
 	return out, nil
 }
 
-// dataBytes returns the bytes of the unnamed $DATA attribute of a FILE
-// record, handling both resident and non-resident storage.
-func (r *realNTFS) dataBytes(fr *fileRecord) ([]byte, bool, error) {
+// attrBytes returns the content of the first unnamed attribute with the
+// given type code, materialising a non-resident attribute from its
+// runlist. ok is false when the record has no such attribute.
+func (r *realNTFS) attrBytes(fr *fileRecord, typeCode uint32) ([]byte, bool, error) {
 	for _, a := range fr.attrs {
-		if a.typeCode != attrData || a.name != "" {
+		if a.typeCode != typeCode || a.name != "" {
 			continue
 		}
 		if !a.nonResident {
@@ -717,6 +743,12 @@ func (r *realNTFS) dataBytes(fr *fileRecord) ([]byte, bool, error) {
 		return b, true, nil
 	}
 	return nil, false, nil
+}
+
+// dataBytes returns the bytes of the unnamed $DATA attribute of a FILE
+// record, handling both resident and non-resident storage.
+func (r *realNTFS) dataBytes(fr *fileRecord) ([]byte, bool, error) {
+	return r.attrBytes(fr, attrData)
 }
 
 // ---- $FILE_NAME ----
@@ -1004,8 +1036,108 @@ func (r *realNTFS) Stat(p string) (filesystem.Stat, error) {
 	return filesystem.NewStat(0o100644, size, recNo), nil
 }
 
+// ReadLink returns the target of a symbolic link or directory junction.
+// On NTFS both are stored as a $REPARSE_POINT attribute (type 0xC0) whose
+// body is a REPARSE_DATA_BUFFER; ReadLink parses the buffer and returns
+// the human-readable print name of the target (falling back to the
+// substitute name when the print name is empty). It errors when the path
+// is not a reparse point or carries a reparse tag that names no target.
 func (r *realNTFS) ReadLink(p string) (string, error) {
-	return "", errors.New("ntfs: ReadLink not implemented for real NTFS")
+	_, fr, err := r.resolvePath(p)
+	if err != nil {
+		return "", err
+	}
+	body, ok, err := r.attrBytes(fr, attrReparsePoint)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("ntfs: %q is not a symlink", p)
+	}
+	target, ok, err := parseReparseTarget(body)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("ntfs: %q has an unsupported reparse tag", p)
+	}
+	return target, nil
+}
+
+// parseReparseTarget decodes a REPARSE_DATA_BUFFER and returns the target
+// path for the two path-naming tags (symlink and mount point). ok is false
+// for any other (recognised-but-non-path) reparse tag; a malformed buffer
+// returns an error.
+func parseReparseTarget(body []byte) (string, bool, error) {
+	if len(body) < reparseHeaderLen {
+		return "", false, fmt.Errorf("ntfs: short reparse point")
+	}
+	tag := binary.LittleEndian.Uint32(body[0:])
+	// ReparseDataLength counts the payload bytes after the 8-byte header.
+	dataLen := int(binary.LittleEndian.Uint16(body[4:]))
+	payload, err := safeio.Slice(body, reparseHeaderLen, dataLen)
+	if err != nil {
+		// A producer that under- or over-reports ReparseDataLength should
+		// not defeat parsing: fall back to whatever follows the header.
+		payload = body[reparseHeaderLen:]
+	}
+	switch tag {
+	case reparseTagSymlink:
+		return parseReparseNames(payload, symlinkPathBufOff)
+	case reparseTagMountPoint:
+		return parseReparseNames(payload, mountPointPathBufOff)
+	default:
+		return "", false, nil
+	}
+}
+
+// parseReparseNames extracts the target path from a symlink/mount-point
+// reparse payload. The payload opens with four 2-byte fields
+// (SubstituteNameOffset, SubstituteNameLength, PrintNameOffset,
+// PrintNameLength), each an offset/length into the trailing PathBuffer
+// that begins at pathBufOff. The print name is preferred; the substitute
+// name (with its "\??\" device prefix stripped) is the fallback.
+func parseReparseNames(payload []byte, pathBufOff int) (string, bool, error) {
+	if len(payload) < 8 || pathBufOff > len(payload) {
+		return "", false, fmt.Errorf("ntfs: short reparse buffer")
+	}
+	subOff := int(binary.LittleEndian.Uint16(payload[0:]))
+	subLen := int(binary.LittleEndian.Uint16(payload[2:]))
+	printOff := int(binary.LittleEndian.Uint16(payload[4:]))
+	printLen := int(binary.LittleEndian.Uint16(payload[6:]))
+	pathBuf := payload[pathBufOff:]
+	name := func(off, ln int) (string, bool) {
+		s, err := safeio.Slice(pathBuf, off, ln)
+		if err != nil {
+			return "", false
+		}
+		return decodeUTF16(s), true
+	}
+	if printLen > 0 {
+		if s, ok := name(printOff, printLen); ok {
+			return s, true, nil
+		}
+	}
+	if subLen > 0 {
+		if s, ok := name(subOff, subLen); ok {
+			return stripNTNamespacePrefix(s), true, nil
+		}
+	}
+	return "", false, fmt.Errorf("ntfs: reparse point has no target name")
+}
+
+// stripNTNamespacePrefix removes the NT object-namespace prefix ("\??\",
+// optionally "\??\UNC\") that decorates a reparse substitute name, leaving
+// the plain path a caller expects. A print name never carries this prefix,
+// so it is only applied on the substitute-name fallback path.
+func stripNTNamespacePrefix(s string) string {
+	if rest, ok := strings.CutPrefix(s, `\??\UNC\`); ok {
+		return `\\` + rest
+	}
+	if rest, ok := strings.CutPrefix(s, `\??\`); ok {
+		return rest
+	}
+	return s
 }
 
 // ---- mutating methods: read-only foundation ----

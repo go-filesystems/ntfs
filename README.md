@@ -25,7 +25,8 @@ Implementation details:
 | Open / Close | ✅ | Minimal in-image implementation |
 | ReadFile / WriteFile | ✅ | Blob storage model inside image |
 | MkDir / Delete / Rename | ✅ | Implemented (recursive delete supported) |
-| ReadLink / Symlinks | ⚠️ No | No NTFS alternate data streams or full symlink support |
+| Symlink (create) | ✅ | NTFSIMG1 in-image driver |
+| ReadLink (read target) | ✅ | Both drivers: NTFSIMG1 metadata, and real NTFS symlinks/junctions via `$REPARSE_POINT` (`IO_REPARSE_TAG_SYMLINK` / `IO_REPARSE_TAG_MOUNT_POINT`) |
 | Free-list reuse | ✅ | In-image free-list and reuse implemented |
 | Volume label | ✅ | `Label` / `SetLabel` (filesystem.Labeller) |
 
