@@ -18,7 +18,12 @@ Implementation details:
 	implement the full NTFS on-disk format. Use a real NTFS implementation for
 	full compatibility or integration tests.
 
-## Support summary
+`Open` sniffs the boot sector: genuine NTFS volumes are handed to a read-only
+on-disk reader (`real_ntfs.go` / `real_ntfs_features.go`) that parses real
+structures straight off disk; the custom `NTFSIMG1` blob format keeps using the
+legacy read/write code path.
+
+## Support summary — NTFSIMG1 (in-image mock, read/write)
 
 | Feature | Status | Notes |
 |---|---:|---|
@@ -26,9 +31,35 @@ Implementation details:
 | ReadFile / WriteFile | ✅ | Blob storage model inside image |
 | MkDir / Delete / Rename | ✅ | Implemented (recursive delete supported) |
 | Symlink (create) | ✅ | NTFSIMG1 in-image driver |
-| ReadLink (read target) | ✅ | Both drivers: NTFSIMG1 metadata, and real NTFS symlinks/junctions via `$REPARSE_POINT` (`IO_REPARSE_TAG_SYMLINK` / `IO_REPARSE_TAG_MOUNT_POINT`) |
+| ReadLink (read target) | ✅ | NTFSIMG1 metadata |
 | Free-list reuse | ✅ | In-image free-list and reuse implemented |
 | Volume label | ✅ | `Label` / `SetLabel` (filesystem.Labeller) |
+
+## Support summary — real on-disk NTFS (read-only)
+
+| Feature | Status | Notes |
+|---|---:|---|
+| Boot sector / $MFT / FILE records | ✅ | USA fixup, attribute walk, fragmented $MFT runlist |
+| Resident / non-resident $DATA | ✅ | Data-run (runlist) decoding |
+| Directory listing | ✅ | `$INDEX_ROOT` + `$INDEX_ALLOCATION` (INDX) |
+| LZNT1 compression | ✅ | Per-compression-unit decode; validated byte-exact vs ntfs-3g |
+| Sparse files | ✅ | Sparse runs read back as zeroes |
+| Named data streams (ADS) | ✅ | `StreamReader`: `ListStreams` / `ReadStream` |
+| Symlinks / junctions | ✅ | `$REPARSE_POINT` (`IO_REPARSE_TAG_SYMLINK` / `IO_REPARSE_TAG_MOUNT_POINT`) and ntfs-3g `IntxLNK`; `ReadLink` |
+| `$ATTRIBUTE_LIST` (spanning records) | ✅ | Extension records stitched; split runlists merged by VCN |
+| Volume label | ✅ | `Label` reads `$VOLUME_NAME` |
+| Write path | ⚠️ No | Read-only reader; mutating methods return an error |
+| EFS-encrypted data | ⚠️ No | Not decodable without the user's keys (clear error) |
+
+Named streams are read through the package's `StreamReader` capability:
+
+```go
+if sr, ok := fs.(ntfs.StreamReader); ok {
+	names, _ := sr.ListStreams("/notes.txt")     // e.g. ["", "author"]
+	author, _ := sr.ReadStream("/notes.txt", "author")
+	_ = author
+}
+```
 
 Notes on current capabilities:
 
@@ -39,8 +70,9 @@ Notes on current capabilities:
 
 ## Limitations
 
-- The driver does not implement NTFS metadata (ACLs, alternate data streams,
-	journaling, or real on-disk structures).
+- The NTFSIMG1 in-image driver does not implement NTFS metadata (ACLs,
+	journaling, or real on-disk structures); the real on-disk reader above is
+	read-only and does not decode EFS-encrypted data.
 - Storage compaction / reuse is not implemented; deleted blobs leave gaps in
 	the image file.
 
