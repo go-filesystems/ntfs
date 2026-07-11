@@ -22,14 +22,23 @@ package filesystem_ntfs
 //   - Symlink/junction target reads via the $REPARSE_POINT attribute
 //     (0xC0): ReadLink parses the REPARSE_DATA_BUFFER for the symlink
 //     (IO_REPARSE_TAG_SYMLINK) and mount-point (IO_REPARSE_TAG_MOUNT_POINT)
-//     tags and returns the target path.
-//   - ReadFile / ListDir / Stat / ReadLink wired to the above.
+//     tags, plus the ntfs-3g / Services-for-Unix "IntxLNK" $DATA form, and
+//     returns the target path.
+//   - LZNT1-compressed non-resident data: readCompressedRuns walks the
+//     runlist a compression unit at a time and decompresses each unit
+//     (see real_ntfs_features.go). Sparse runs read back as zeroes.
+//   - Named data streams (ADS): every $DATA stream is enumerable and
+//     readable through the StreamReader capability interface.
+//   - $ATTRIBUTE_LIST (0x20): attributes that spill into extension FILE
+//     records are stitched back together, concatenating split non-resident
+//     runlists in VCN order (see resolveAttributes).
+//   - ReadFile / ListDir / Stat / ReadLink / ListStreams / ReadStream
+//     wired to the above.
 //
 // What is intentionally NOT implemented here (the reader returns an
-// error or an empty result): any write path, $Bitmap accounting,
-// attribute lists ($ATTRIBUTE_LIST 0x20) that span multiple FILE
-// records, compressed/sparse/encrypted runs, and named data streams.
-// These are documented as follow-up work.
+// error or an empty result): any write path, $Bitmap accounting, and
+// EFS-encrypted ($EFS) data (which cannot be materialised without the
+// user's decryption keys). These are documented as follow-up work.
 
 import (
 	"encoding/binary"
@@ -69,6 +78,24 @@ const (
 	attrIndexAllocation     = 0xA0
 	attrReparsePoint        = 0xC0
 	attrEnd                 = 0xFFFFFFFF
+
+	// Attribute flags word (record header offset 0x0C).
+	attrFlagCompressed = 0x0001 // LZNT1-compressed non-resident data
+	attrFlagEncrypted  = 0x4000 // EFS-encrypted (not decodable without keys)
+	attrFlagSparse     = 0x8000 // sparse non-resident data
+
+	// LZNT1 compression: one decompressed sub-block ("chunk") is 4096 bytes.
+	lznt1ChunkSize = 0x1000
+
+	// intxLnkMagic is the 8-byte marker ntfs-3g / Services-for-Unix write at
+	// the head of a symlink's $DATA when the link is stored as a system file
+	// rather than as a $REPARSE_POINT. The UTF-16LE target path follows it.
+	intxLnkMagic = "IntxLNK\x01"
+
+	// maxAttrListRecords bounds how many distinct extension MFT records one
+	// $ATTRIBUTE_LIST may pull in, so a malicious list cannot fan out into an
+	// unbounded read storm.
+	maxAttrListRecords = 4096
 
 	// Reparse-point tags that name a path target. NTFS stores symbolic
 	// links and directory junctions (mount points) as a $REPARSE_POINT
@@ -411,12 +438,35 @@ type attribute struct {
 	name        string
 	nonResident bool
 
+	// flags is the attribute flags word (record header offset 0x0C):
+	// bit 0x0001 = compressed, 0x4000 = encrypted, 0x8000 = sparse.
+	flags uint16
+	// attrID is the per-record attribute instance id (record header offset
+	// 0x0E), used to disambiguate attribute-list fragments.
+	attrID uint16
+
 	// resident payload
 	residentData []byte
 
 	// non-resident payload
 	runs     []dataRun
-	realSize uint64 // logical data size in bytes
+	realSize uint64 // logical data size in bytes (authoritative on the VCN-0 fragment)
+	// startVCN/lastVCN bound the runlist fragment this attribute record
+	// carries. A single-record attribute starts at VCN 0; attribute-list
+	// fragments carry successive VCN ranges that resolveAttributes stitches
+	// back into one logical attribute.
+	startVCN uint64
+	lastVCN  uint64
+	// compUnit is the compression-unit size exponent from the non-resident
+	// header (offset 0x22): the unit spans 2^compUnit clusters. Zero means the
+	// stream is not compressed.
+	compUnit uint16
+}
+
+// isCompressed reports whether this attribute stores LZNT1-compressed data (a
+// non-zero compression unit and the compressed flag set).
+func (a *attribute) isCompressed() bool {
+	return a.nonResident && a.compUnit != 0 && a.flags&attrFlagCompressed != 0
 }
 
 // readFileRecordAt reads one FILE record at an absolute byte offset,
@@ -429,8 +479,24 @@ func (r *realNTFS) readFileRecordAt(off int64) (*fileRecord, error) {
 	return r.parseFileRecord(buf)
 }
 
-// readFileRecord reads MFT record recNo.
+// readFileRecord reads MFT record recNo and, when the record carries an
+// $ATTRIBUTE_LIST (0x20), stitches in the attributes that spilled into
+// extension records so callers see one complete attribute set.
 func (r *realNTFS) readFileRecord(recNo uint64) (*fileRecord, error) {
+	fr, err := r.readFileRecordRaw(recNo)
+	if err != nil {
+		return nil, err
+	}
+	if err := r.resolveAttributes(recNo, fr); err != nil {
+		return nil, err
+	}
+	return fr, nil
+}
+
+// readFileRecordRaw reads MFT record recNo WITHOUT following any
+// $ATTRIBUTE_LIST. resolveAttributes uses it to pull in extension records
+// without recursing back through the attribute-list machinery.
+func (r *realNTFS) readFileRecordRaw(recNo uint64) (*fileRecord, error) {
 	off, ok := r.mftRecordOffset(recNo)
 	if !ok {
 		return nil, fmt.Errorf("ntfs: MFT record %d unreachable", recNo)
@@ -491,6 +557,8 @@ func (r *realNTFS) parseAttribute(buf []byte) (attribute, error) {
 	nonResident := buf[8]
 	nameLen := int(buf[9])
 	nameOff := int(binary.LittleEndian.Uint16(buf[10:]))
+	a.flags = binary.LittleEndian.Uint16(buf[0x0C:])
+	a.attrID = binary.LittleEndian.Uint16(buf[0x0E:])
 	if nameLen > 0 {
 		if name, err := safeio.Slice(buf, nameOff, nameLen*2); err == nil {
 			a.name = decodeUTF16(name)
@@ -515,6 +583,12 @@ func (r *realNTFS) parseAttribute(buf []byte) (attribute, error) {
 		return a, fmt.Errorf("ntfs: short non-resident attribute header: %w", err)
 	}
 	a.nonResident = true
+	a.startVCN = binary.LittleEndian.Uint64(buf[0x10:])
+	a.lastVCN = binary.LittleEndian.Uint64(buf[0x18:])
+	a.compUnit = binary.LittleEndian.Uint16(buf[0x22:])
+	// The real-size field (0x30) is only meaningful on the first fragment
+	// (startVCN 0); later attribute-list fragments repeat the allocated size
+	// but resolveAttributes takes realSize from the VCN-0 fragment.
 	a.realSize = binary.LittleEndian.Uint64(buf[0x30:])
 	runOff := int(binary.LittleEndian.Uint16(buf[0x20:]))
 	runData, err := safeio.Slice(buf, runOff, len(buf)-runOff)
@@ -725,18 +799,38 @@ func (r *realNTFS) readRuns(runs []dataRun, size uint64) ([]byte, error) {
 	return out, nil
 }
 
+// readAttrData materialises the full logical content of one attribute,
+// transparently handling resident storage, plain non-resident runlists,
+// sparse holes (zero-filled by readRuns) and LZNT1-compressed non-resident
+// data. It is the single funnel every content read goes through so that
+// compression and sparseness are handled uniformly for the default $DATA,
+// named streams (ADS) and metadata attributes alike.
+func (r *realNTFS) readAttrData(a *attribute) ([]byte, error) {
+	if !a.nonResident {
+		return a.residentData, nil
+	}
+	// EFS-encrypted content cannot be materialised without the user's keys;
+	// surface a clear error rather than returning ciphertext as if it were
+	// the file's data.
+	if a.flags&attrFlagEncrypted != 0 {
+		return nil, fmt.Errorf("ntfs: encrypted ($EFS) data is not decodable without keys")
+	}
+	if a.isCompressed() {
+		return r.readCompressedRuns(a.runs, a.realSize, a.compUnit)
+	}
+	return r.readRuns(a.runs, a.realSize)
+}
+
 // attrBytes returns the content of the first unnamed attribute with the
 // given type code, materialising a non-resident attribute from its
 // runlist. ok is false when the record has no such attribute.
 func (r *realNTFS) attrBytes(fr *fileRecord, typeCode uint32) ([]byte, bool, error) {
-	for _, a := range fr.attrs {
+	for i := range fr.attrs {
+		a := &fr.attrs[i]
 		if a.typeCode != typeCode || a.name != "" {
 			continue
 		}
-		if !a.nonResident {
-			return a.residentData, true, nil
-		}
-		b, err := r.readRuns(a.runs, a.realSize)
+		b, err := r.readAttrData(a)
 		if err != nil {
 			return nil, true, err
 		}
@@ -746,7 +840,7 @@ func (r *realNTFS) attrBytes(fr *fileRecord, typeCode uint32) ([]byte, bool, err
 }
 
 // dataBytes returns the bytes of the unnamed $DATA attribute of a FILE
-// record, handling both resident and non-resident storage.
+// record, handling resident, non-resident, sparse and compressed storage.
 func (r *realNTFS) dataBytes(fr *fileRecord) ([]byte, bool, error) {
 	return r.attrBytes(fr, attrData)
 }
@@ -1051,17 +1145,25 @@ func (r *realNTFS) ReadLink(p string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if !ok {
-		return "", fmt.Errorf("ntfs: %q is not a symlink", p)
+	if ok {
+		target, ok, err := parseReparseTarget(body)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("ntfs: %q has an unsupported reparse tag", p)
+		}
+		return target, nil
 	}
-	target, ok, err := parseReparseTarget(body)
-	if err != nil {
+	// No $REPARSE_POINT: fall back to the ntfs-3g / Services-for-Unix
+	// "IntxLNK" convention, where a symlink is a plain file whose $DATA
+	// begins with the 8-byte marker followed by the UTF-16LE target.
+	if target, ok, err := r.intxLinkTarget(fr); err != nil {
 		return "", err
+	} else if ok {
+		return target, nil
 	}
-	if !ok {
-		return "", fmt.Errorf("ntfs: %q has an unsupported reparse tag", p)
-	}
-	return target, nil
+	return "", fmt.Errorf("ntfs: %q is not a symlink", p)
 }
 
 // parseReparseTarget decodes a REPARSE_DATA_BUFFER and returns the target
