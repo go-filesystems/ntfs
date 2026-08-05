@@ -34,6 +34,8 @@ legacy read/write code path.
 | ReadLink (read target) | ✅ | NTFSIMG1 metadata |
 | Free-list reuse | ✅ | In-image free-list and reuse implemented |
 | Volume label | ✅ | `Label` / `SetLabel` (filesystem.Labeller) |
+| Grow / Shrink / Resize | ✅ | `FS.Grow` / `FS.Shrink` / `FS.Resize` resize the NTFSIMG1 image in place; NOT real on-disk NTFS resize (real reader returns an error) |
+| Compaction | ✅ | `FS.Compact` relocates blobs to remove fragmentation and rebuilds the free-list; `FS.FragmentationStats` / `FS.Layout` report usage and layout |
 
 ## Support summary — real on-disk NTFS (read-only)
 
@@ -73,19 +75,24 @@ Notes on current capabilities:
 - The NTFSIMG1 in-image driver does not implement NTFS metadata (ACLs,
 	journaling, or real on-disk structures); the real on-disk reader above is
 	read-only and does not decode EFS-encrypted data.
-- Storage compaction / reuse is not implemented; deleted blobs leave gaps in
-	the image file.
+- `Grow`/`Shrink`/`Resize` and `Compact` operate on the NTFSIMG1 image format
+	only; the real on-disk NTFS reader is read-only and returns an error for
+	all of them (resizing a real NTFS volume would require manipulating the
+	MFT, `$Bitmap`, and runlists — a separate, much larger project).
 
-## Free-list and reuse
+## Free-list, reuse, and compaction
 
-- The driver now maintains an in-image free-list of blob extents freed by
-	delete operations and reuses those extents for subsequent writes when a
+- The driver maintains an in-image free-list of blob extents freed by delete
+	operations and reuses those extents for subsequent writes when a
 	suitably-sized extent is available. Contiguous free extents are coalesced
 	to reduce fragmentation.
+- `FS.Compact()` relocates blobs to remove fragmentation and rebuilds the
+	free-list as a single tail extent; `FS.FragmentationStats()` reports file
+	count, bytes used, free-extent count, total free bytes, and largest free
+	extent; `FS.Layout()` returns the current per-file blob layout.
 
 ## Future improvements
 
-- Implement compaction to defragment storage and reduce image growth.
 - Add more NTFS metadata (timestamps, inodes, ACLs) for better compatibility.
 
 ## Implements
