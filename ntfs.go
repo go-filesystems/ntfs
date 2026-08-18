@@ -144,7 +144,12 @@ func (fs *ntfsFS) loadIndex() error {
 	if err := binary.Read(r, binary.LittleEndian, &cnt); err != nil {
 		return err
 	}
-	idx := make(map[string]fileEntry, cnt)
+	// cnt and freeCount below are raw uint32s off the image, so neither may be
+	// used as an allocation hint: make(..., cnt) reserves for a count the image
+	// has not proved it holds. Both loops already stop at EOF, so growing on
+	// demand costs a few reallocations for a real image and nothing for a
+	// hostile one.
+	idx := make(map[string]fileEntry)
 	for i := 0; i < int(cnt); i++ {
 		var nl uint16
 		if err := binary.Read(r, binary.LittleEndian, &nl); err != nil {
@@ -181,7 +186,10 @@ func (fs *ntfsFS) loadIndex() error {
 	// attempt to read free-list (backwards-compatible: older images may not have it)
 	var freeCount uint32
 	if err := binary.Read(r, binary.LittleEndian, &freeCount); err == nil {
-		fl := make([]fileEntry, 0, freeCount)
+		// No capacity hint from freeCount: at 4.29e9 entries x 24 bytes it asks for
+		// ~103 GB. A fuzz corpus entry drove exactly this on CI --
+		// "fatal error: runtime: out of memory", the runtime trying to map 41.9 GB.
+		var fl []fileEntry
 		for i := 0; i < int(freeCount); i++ {
 			var off uint64
 			var sz uint64
@@ -686,11 +694,46 @@ func (fs *ntfsFS) GetMetadata(p string) (metaEntry, error) {
 	return metaEntry{}, fmt.Errorf("ntfs: %q not found", p)
 }
 
+// maxEntryBytes bounds what a single index entry may claim, for offset and for
+// size alike. Both come off the image unvalidated, and both are uint64, so
+// without a ceiling `make([]byte, e.Size)` panics outright ("makeslice: len out
+// of range") and `int64(e.Offset)` silently goes negative past 1<<63. 1 PiB is
+// far beyond any image this package will legitimately open and far below either
+// hazard.
+const maxEntryBytes = 1 << 50
+
+// entryExtent validates an index entry against the image actually behind it and
+// returns the absolute offset its content starts at.
+//
+// A size read from a malformed image must never reach make(): that is a panic in
+// the caller's process, not an error it can handle. So the claim is checked
+// against reality by reading the entry's LAST byte — the image either has it or
+// the entry is lying — which costs one ReadAt and needs no size accessor on the
+// diskRW interface.
+func (fs *ntfsFS) entryExtent(p string, e fileEntry) (int64, error) {
+	if e.Size > maxEntryBytes || e.Offset > maxEntryBytes {
+		return 0, fmt.Errorf("ntfs: %q claims offset %d size %d, beyond the %d-byte limit", p, e.Offset, e.Size, uint64(maxEntryBytes))
+	}
+	start := fs.contentStart() + int64(e.Offset)
+	if e.Size == 0 {
+		return start, nil
+	}
+	var probe [1]byte
+	if _, err := fs.f.ReadAt(probe[:], start+int64(e.Size)-1); err != nil {
+		return 0, fmt.Errorf("ntfs: %q claims %d bytes at offset %d, past the end of the image", p, e.Size, e.Offset)
+	}
+	return start, nil
+}
+
 func (fs *ntfsFS) ReadFile(p string) ([]byte, error) {
 	p = normalizePath(p)
 	if e, ok := fs.index[p]; ok && !e.IsDir {
+		start, err := fs.entryExtent(p, e)
+		if err != nil {
+			return nil, err
+		}
 		b := make([]byte, e.Size)
-		if _, err := fs.f.ReadAt(b, fs.contentStart()+int64(e.Offset)); err != nil && err != io.EOF {
+		if _, err := fs.f.ReadAt(b, start); err != nil && err != io.EOF {
 			return nil, err
 		}
 		return b, nil
