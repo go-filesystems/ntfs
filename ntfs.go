@@ -144,7 +144,12 @@ func (fs *ntfsFS) loadIndex() error {
 	if err := binary.Read(r, binary.LittleEndian, &cnt); err != nil {
 		return err
 	}
-	idx := make(map[string]fileEntry, cnt)
+	// cnt and freeCount below are raw uint32s off the image, so neither may be
+	// used as an allocation hint: make(..., cnt) reserves for a count the image
+	// has not proved it holds. Both loops already stop at EOF, so growing on
+	// demand costs a few reallocations for a real image and nothing for a
+	// hostile one.
+	idx := make(map[string]fileEntry)
 	for i := 0; i < int(cnt); i++ {
 		var nl uint16
 		if err := binary.Read(r, binary.LittleEndian, &nl); err != nil {
@@ -181,7 +186,10 @@ func (fs *ntfsFS) loadIndex() error {
 	// attempt to read free-list (backwards-compatible: older images may not have it)
 	var freeCount uint32
 	if err := binary.Read(r, binary.LittleEndian, &freeCount); err == nil {
-		fl := make([]fileEntry, 0, freeCount)
+		// No capacity hint from freeCount: at 4.29e9 entries x 24 bytes it asks for
+		// ~103 GB. A fuzz corpus entry drove exactly this on CI --
+		// "fatal error: runtime: out of memory", the runtime trying to map 41.9 GB.
+		var fl []fileEntry
 		for i := 0; i < int(freeCount); i++ {
 			var off uint64
 			var sz uint64
