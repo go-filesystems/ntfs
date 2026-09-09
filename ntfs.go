@@ -102,21 +102,28 @@ func Open(imagePath string, partIndex int) (FS, error) {
 		return nil, fmt.Errorf("ntfs: open %s: %w", imagePath, err)
 	}
 	// underlying *os.File implements ReaderAt/WriterAt/Closer
-	f := diskRW(f0)
+	fs, err := openAt(diskRW(f0))
+	if err != nil {
+		f0.Close()
+		return nil, err
+	}
+	return fs, nil
+}
+
+// openAt reads the volume that starts at offset zero of f, whatever the caller
+// opened. It is the whole of Open after the file is settled, and it is shared
+// with OpenReader so the two cannot drift -- the routing below is the kind of
+// thing that would otherwise be remembered in one place and forgotten in the
+// other.
+func openAt(f diskRW) (FS, error) {
 	// Route genuine NTFS volumes (OEM id "NTFS    " + 0xAA55 boot
 	// signature) to the read-only real-NTFS reader; the legacy NTFSIMG1
 	// mock format keeps the original code path below.
 	if looksLikeRealNTFS(f, 0) {
-		rfs, err := openRealNTFS(f, 0)
-		if err != nil {
-			f.Close()
-			return nil, err
-		}
-		return rfs, nil
+		return openRealNTFS(f, 0)
 	}
 	fs := &ntfsFS{f: f, partOffset: 0, index: map[string]fileEntry{}}
 	if err := fs.loadIndex(); err != nil {
-		f.Close()
 		return nil, err
 	}
 	return fs, nil
