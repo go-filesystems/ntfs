@@ -653,8 +653,16 @@ func TestRealNTFS_RunlistNegativeDelta(t *testing.T) {
 // formats a real image and reads a file back through the new reader. It
 // never fails the suite when the tool is missing.
 func TestInterop_mkntfs(t *testing.T) {
+	// NTFS_REQUIRE_PROGS=1 turns every escape hatch below into a failure. The
+	// lane that installs ntfs-3g sets it: a judge that can quietly not run is
+	// not a control, and three of the four exits here are failures of the
+	// TOOL rather than its absence -- which must never read as a pass.
+	require := os.Getenv("NTFS_REQUIRE_PROGS") != ""
 	mkntfs, err := exec.LookPath("mkntfs")
 	if err != nil {
+		if require {
+			t.Fatalf("NTFS_REQUIRE_PROGS is set but ntfs-3g/ntfsprogs is not installed: %v", err)
+		}
 		t.Skip("mkntfs not on PATH; skipping interop test")
 	}
 	dir := t.TempDir()
@@ -667,10 +675,16 @@ func TestInterop_mkntfs(t *testing.T) {
 		}
 	}
 	if err := os.Truncate(img, 8*1024*1024); err != nil {
+		if require {
+			t.Fatalf("cannot size interop image: %v", err)
+		}
 		t.Skipf("cannot size interop image: %v", err)
 	}
 	cmd := exec.Command(mkntfs, "-F", "-q", "-L", "INTEROP", img)
 	if out, err := cmd.CombinedOutput(); err != nil {
+		if require {
+			t.Fatalf("mkntfs failed (%v): %s", err, out)
+		}
 		t.Skipf("mkntfs failed (%v): %s", err, out)
 	}
 	fs, err := Open(img, 0)
