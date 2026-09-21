@@ -54,6 +54,18 @@ jobs:
           cache: true
           cache-dependency-path: ntfs/go.mod
 
+      # ntfs-3g ships mkntfs, the reference formatter. TestInterop_mkntfs has
+      # it write an image and reads that image back with OUR reader, so the
+      # subject is our parser and the author of the bytes is upstream. It needs
+      # no privilege: mkntfs -F formats a plain FILE.
+      #
+      # The two WRITE-side tests here stay skipped on purpose. Our writer emits
+      # a custom NTFSIMG1 container rather than real NTFS, so ntfsfix and
+      # ntfsls reject it -- an accurate statement of a known limit, not a stale
+      # gate.
+      - name: ntfs-3g, the reference formatter for the read side
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ntfs-3g
+
       - name: Build
         working-directory: ntfs
         env:
@@ -62,6 +74,9 @@ jobs:
 
       - name: Test (short, race, coverage)
         working-directory: ntfs
+        env:
+          # A skip here would look exactly like a pass.
+          NTFS_REQUIRE_PROGS: "1"
         run: |
           set -euo pipefail
           go test -short -race -timeout 20m \
