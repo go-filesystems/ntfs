@@ -45,6 +45,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"math"
 	"os"
 	"sort"
@@ -1038,7 +1039,7 @@ func (r *realNTFS) resolvePath(p string) (uint64, *fileRecord, error) {
 			}
 		}
 		if !found {
-			return 0, nil, fmt.Errorf("ntfs: %q not found", p)
+			return 0, nil, fmt.Errorf("ntfs: %q not found: %w", p, iofs.ErrNotExist)
 		}
 		curNo = nextNo
 		cur, err = r.readFileRecord(curNo)

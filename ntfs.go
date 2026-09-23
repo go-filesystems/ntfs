@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path"
 	"sort"
@@ -478,6 +479,33 @@ func (fs *ntfsFS) ListDir(p string) ([]filesystem.DirEntry, error) {
 	} else {
 		prefix = p + "/"
 	}
+	// ⛔ A DIRECTORY THAT IS NOT THERE MUST SAY SO. This walked the index by
+	// prefix and returned whatever matched, so a path that does not exist
+	// produced an EMPTY listing and a nil error -- which a server reads as
+	// "the directory is there and has nothing in it", not as 404. Found by the
+	// fs.ErrNotExist contract test: every other operation refused the missing
+	// path and this one answered it.
+	//
+	// A directory exists if the index names it, or if anything is under it:
+	// the index holds paths, so a directory with children need not carry an
+	// entry of its own.
+	exists := p == "/"
+	if !exists {
+		if _, ok := fs.index[p]; ok {
+			exists = true
+		} else {
+			for name := range fs.index {
+				if strings.HasPrefix(name, prefix) {
+					exists = true
+					break
+				}
+			}
+		}
+	}
+	if !exists {
+		return nil, fmt.Errorf("ntfs: %q not found: %w", p, iofs.ErrNotExist)
+	}
+
 	entriesMap := map[string]uint8{}
 	for name := range fs.index {
 		if name == p {
@@ -698,7 +726,7 @@ func (fs *ntfsFS) GetMetadata(p string) (metaEntry, error) {
 	if me, ok := fs.meta[p]; ok {
 		return me, nil
 	}
-	return metaEntry{}, fmt.Errorf("ntfs: %q not found", p)
+	return metaEntry{}, fmt.Errorf("ntfs: %q not found: %w", p, iofs.ErrNotExist)
 }
 
 // maxEntryBytes bounds what a single index entry may claim, for offset and for
@@ -745,7 +773,7 @@ func (fs *ntfsFS) ReadFile(p string) ([]byte, error) {
 		}
 		return b, nil
 	}
-	return nil, fmt.Errorf("ntfs: %q not found", p)
+	return nil, fmt.Errorf("ntfs: %q not found: %w", p, iofs.ErrNotExist)
 }
 
 func (fs *ntfsFS) Stat(p string) (filesystem.Stat, error) {
@@ -767,7 +795,7 @@ func (fs *ntfsFS) Stat(p string) (filesystem.Stat, error) {
 		}
 		return filesystem.NewStat(mode, e.Size, me.Inode), nil
 	}
-	return nil, fmt.Errorf("ntfs: %q not found", p)
+	return nil, fmt.Errorf("ntfs: %q not found: %w", p, iofs.ErrNotExist)
 }
 
 func (fs *ntfsFS) WriteFile(p string, data []byte, perm os.FileMode) error {
@@ -901,7 +929,7 @@ func (fs *ntfsFS) DeleteFile(p string) error {
 	p = normalizePath(p)
 	e, ok := fs.index[p]
 	if !ok {
-		return fmt.Errorf("ntfs: %q not found", p)
+		return fmt.Errorf("ntfs: %q not found: %w", p, iofs.ErrNotExist)
 	}
 	if e.Offset > 0 && e.Size > 0 {
 		fs.freeList = append(fs.freeList, fileEntry{Offset: e.Offset, Size: e.Size})
@@ -943,7 +971,7 @@ func (fs *ntfsFS) Rename(oldPath, newPath string) error {
 	newPath = normalizePath(newPath)
 	e, ok := fs.index[oldPath]
 	if !ok {
-		return fmt.Errorf("ntfs: %q not found", oldPath)
+		return fmt.Errorf("ntfs: %q not found: %w", oldPath, iofs.ErrNotExist)
 	}
 	// prevent moving directory into itself
 	if e.IsDir && (newPath == oldPath || strings.HasPrefix(newPath+"/", oldPath+"/")) {
