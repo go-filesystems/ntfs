@@ -60,14 +60,42 @@ func (r *realNTFS) readCompressedRuns(runs []dataRun, size uint64, compUnit uint
 	if !ok || unitBytes <= 0 {
 		return nil, fmt.Errorf("ntfs: compression unit size overflow")
 	}
+	// A unit is 16 clusters of at most 4096 bytes (Linux ntfs3 NTFS_LZNT_CUNIT,
+	// NTFS_LZNT_MAX_CLUSTER). The LZNT1 output buffer is sized by it.
+	if unitBytes > maxCompUnitBytes {
+		return nil, fmt.Errorf("ntfs: compression unit of %d bytes exceeds %d", unitBytes, maxCompUnitBytes)
+	}
 	if size > uint64(math.MaxInt64) {
 		return nil, fmt.Errorf("ntfs: compressed data size %d too large", size)
 	}
-	out, err := safeio.MakeBytes(int64(size), maxDataSize)
+	// The output cannot be larger than the runlist describes (sparse tail
+	// included): realSize is a claim, the runlist is what the reader can back.
+	var capBytes int64
+	for _, run := range runs {
+		rb, ok := mulCheck(run.lengthClusters, cs)
+		if !ok {
+			return nil, fmt.Errorf("ntfs: run capacity overflow")
+		}
+		if capBytes, ok = addCheck(capBytes, rb); !ok {
+			return nil, fmt.Errorf("ntfs: run capacity overflow")
+		}
+	}
+	want := int64(size)
+	if want > capBytes {
+		want = capBytes
+	}
+	if want > r.dataLimit() {
+		return nil, fmt.Errorf("ntfs: compressed data buffer: %w: size %d exceeds ceiling %d", safeio.ErrTooLarge, want, r.dataLimit())
+	}
+	// Every allocated cluster the read reaches must exist in the image; sparse
+	// holes are part of a compressed stream and stay allowed.
+	if err := r.checkRunsBacked(runs, want, true); err != nil {
+		return nil, err
+	}
+	out, err := safeio.MakeBytes(want, r.dataLimit())
 	if err != nil {
 		return nil, fmt.Errorf("ntfs: compressed data buffer: %w", err)
 	}
-	want := int64(len(out))
 
 	rr := &runReader{r: r, runs: runs}
 	// Each iteration advances the logical position by one compression unit, so
@@ -386,6 +414,13 @@ func (r *realNTFS) ReadStream(p, name string) ([]byte, error) {
 // $DATA begins with the "IntxLNK\1" marker followed by the UTF-16LE target.
 // ok is false when the file is not an IntxLNK symlink.
 func (r *realNTFS) intxLinkTarget(fr *fileRecord) (string, bool, error) {
+	// A link's target is a path, so a default stream larger than any path is not
+	// one: say so from the declared size instead of reading the file to look.
+	for i := range fr.attrs {
+		if a := &fr.attrs[i]; a.typeCode == attrData && a.name == "" && a.realSize > maxIntxLinkBytes {
+			return "", false, nil
+		}
+	}
 	data, ok, err := r.dataBytes(fr)
 	if err != nil || !ok {
 		return "", false, err

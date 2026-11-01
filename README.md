@@ -70,6 +70,36 @@ Notes on current capabilities:
 - Directory rename: renaming a directory updates all nested entries.
 - Deletion: `DeleteDir` removes a directory and its contents recursively.
 
+## Untrusted input
+
+An image is attacker-controlled data. Every allocation a value in the image can
+size is bounded before it happens, and a hostile image gets an error, not an
+out-of-memory kill:
+
+- a data run must lie inside the image (the last byte of every allocated span
+  is read before the buffer is made), and metadata attributes
+  (`$INDEX_ALLOCATION`, `$ATTRIBUTE_LIST`, `$REPARSE_POINT`) may not be sparse;
+- a compressed stream is sized by its runlist, not by the `realSize` claim, and
+  a compression unit is at most 64 KiB (Linux ntfs3: 16 clusters of at most
+  4096 bytes);
+- index entries must be at least 0x10 bytes with the key inside the entry
+  (Linux ntfs3 `hdr_find_e`), so overlapping keys cannot multiply the output;
+- `ReadLink` does not read a file larger than a path to look for the
+  `IntxLNK` marker;
+- sparse `$DATA` legitimately reads back bigger than the image, so it has a
+  ceiling: `DefaultMaxDataSize` (1 GiB), lowered with `SetMaxDataSize` on the
+  `DataLimiter` that `Open` returns. A read over it fails with an error that
+  wraps `ntfs.ErrTooLarge` before anything is allocated.
+
+```go
+if l, ok := fsys.(ntfs.DataLimiter); ok {
+    l.SetMaxDataSize(64 << 20)
+}
+```
+
+`FuzzRealNTFS` and `FuzzOpen` drive the read surface; the regression tests are
+in `bombs_test.go`.
+
 ## Limitations
 
 - The NTFSIMG1 in-image driver does not implement NTFS metadata (ACLs,

@@ -163,8 +163,8 @@ func (fs *ntfsFS) loadIndex() error {
 		if err := binary.Read(r, binary.LittleEndian, &nl); err != nil {
 			return err
 		}
-		name := make([]byte, nl)
-		if _, err := io.ReadFull(r, name); err != nil {
+		name, err := readSized(r, int64(nl))
+		if err != nil {
 			return err
 		}
 		var d uint8
@@ -225,8 +225,8 @@ func (fs *ntfsFS) loadIndex() error {
 				if err := binary.Read(mr, binary.LittleEndian, &nl); err != nil {
 					break
 				}
-				name := make([]byte, nl)
-				if _, err := io.ReadFull(mr, name); err != nil {
+				name, err := readSized(mr, int64(nl))
+				if err != nil {
 					break
 				}
 				var me metaEntry
@@ -261,8 +261,8 @@ func (fs *ntfsFS) loadIndex() error {
 					break
 				}
 				if linkLen > 0 {
-					lnk := make([]byte, linkLen)
-					if _, err := io.ReadFull(mr, lnk); err != nil {
+					lnk, err := readSized(mr, int64(linkLen))
+					if err != nil {
 						break
 					}
 					me.LinkTarget = string(lnk)
@@ -272,8 +272,8 @@ func (fs *ntfsFS) loadIndex() error {
 					break
 				}
 				if aclLen > 0 {
-					acl := make([]byte, aclLen)
-					if _, err := io.ReadFull(mr, acl); err != nil {
+					acl, err := readSized(mr, int64(aclLen))
+					if err != nil {
 						break
 					}
 					me.ACL = acl
@@ -296,13 +296,27 @@ func (fs *ntfsFS) loadIndex() error {
 		lr := bytes.NewReader(buf[li+len(labelMagic):])
 		var ll uint16
 		if err := binary.Read(lr, binary.LittleEndian, &ll); err == nil && ll > 0 {
-			lb := make([]byte, ll)
-			if _, err := io.ReadFull(lr, lb); err == nil {
+			if lb, err := readSized(lr, int64(ll)); err == nil {
 				fs.label = string(lb)
 			}
 		}
 	}
 	return nil
+}
+
+// readSized reads exactly n bytes from r, refusing before it allocates when r
+// does not hold n more. n comes off the image (a uint16 or a uint32), and the
+// header buffer r reads is headerSize bytes: make([]byte, n) first and
+// io.ReadFull second reserved up to 4 GiB for a 40-byte header.
+func readSized(r *bytes.Reader, n int64) ([]byte, error) {
+	if n < 0 || n > int64(r.Len()) {
+		return nil, io.ErrUnexpectedEOF
+	}
+	b := make([]byte, n)
+	if _, err := io.ReadFull(r, b); err != nil {
+		return nil, err
+	}
+	return b, nil
 }
 
 func (fs *ntfsFS) saveIndex() error {
@@ -603,7 +617,12 @@ func (fs *ntfsFS) Compact() error {
 			continue
 		}
 		if e.Size > 0 {
-			// read into memory then write to new location
+			// read into memory then write to new location. The size is an
+			// index entry's claim: check it against the image before it sizes a
+			// buffer (entryExtent reads the entry's last byte).
+			if _, err := fs.entryExtent(k, e); err != nil {
+				return err
+			}
 			buf := make([]byte, e.Size)
 			if _, err := fs.f.ReadAt(buf, fs.contentStart()+int64(e.Offset)); err != nil && err != io.EOF {
 				return err
@@ -754,7 +773,10 @@ func (fs *ntfsFS) entryExtent(p string, e fileEntry) (int64, error) {
 		return start, nil
 	}
 	var probe [1]byte
-	if _, err := fs.f.ReadAt(probe[:], start+int64(e.Size)-1); err != nil {
+	// The byte has to arrive: a reader past its end reports an error or io.EOF,
+	// and a lenient one reports (0, nil) -- only n == 1 proves the entry's last
+	// byte is in the image.
+	if n, _ := fs.f.ReadAt(probe[:], start+int64(e.Size)-1); n != 1 {
 		return 0, fmt.Errorf("ntfs: %q claims %d bytes at offset %d, past the end of the image", p, e.Size, e.Offset)
 	}
 	return start, nil
