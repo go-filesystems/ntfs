@@ -151,6 +151,18 @@ const (
 	// overflow or a huge allocation. 2^40 clusters is a petabyte-scale
 	// ceiling that no legitimate run reaches.
 	maxRunLengthClusters = int64(1) << 40
+	// maxCompUnitBytes caps the byte size of one compression unit. Linux ntfs3
+	// writes only 2^4 = 16 clusters per unit (NTFS_LZNT_CUNIT) and refuses to
+	// compress above a 4096-byte cluster (NTFS_LZNT_MAX_CLUSTER), so a unit is
+	// at most 16 * 4096 = 64 KiB. A hostile exponent (up to 30) times the
+	// cluster size would otherwise size the LZNT1 output buffer at hundreds of
+	// GiB before a single byte is decoded.
+	maxCompUnitBytes = 64 << 10
+	// maxIntxLinkBytes bounds the $DATA of an IntxLNK symlink: the 8-byte
+	// marker plus a UTF-16 path of at most 32767 characters. ReadLink reads
+	// the whole default stream to look for the marker, so a larger file is
+	// not a link and must not be materialised to find that out.
+	maxIntxLinkBytes = 8 + 2*32768
 	// minBytesPerSector is the smallest sane sector size; NTFS uses 512 and
 	// up. Anything below this (notably 1, which makes sectorEnd-2 negative)
 	// is rejected. The boot field is a uint16 so the value is already
@@ -189,6 +201,54 @@ type realNTFS struct {
 	// arbitrary MFT record number to a byte offset even when the MFT is
 	// fragmented.
 	mftRuns []dataRun
+
+	// maxData is the ceiling on the bytes one attribute read may allocate;
+	// zero means DefaultMaxDataSize. See SetMaxDataSize.
+	maxData int64
+}
+
+// DefaultMaxDataSize is the most bytes one ReadFile / ReadStream / directory
+// read will materialise from a real NTFS volume unless SetMaxDataSize says
+// otherwise. A sparse file legitimately reads back as far more bytes than the
+// image holds, so this is a ceiling on the amplification, not a structural
+// bound; the structural bounds (a run must lie inside the image, metadata is
+// never sparse) are applied first.
+const DefaultMaxDataSize = maxDataSize
+
+// ErrTooLarge is wrapped by the error a read returns when the data it would
+// have to materialise exceeds the ceiling. Test it with errors.Is.
+var ErrTooLarge = safeio.ErrTooLarge
+
+// DataLimiter is implemented by the filesystem Open and OpenReader return for
+// a genuine NTFS volume. A caller reading untrusted images asserts for it to
+// lower the per-read ceiling:
+//
+//	if l, ok := fs.(ntfs.DataLimiter); ok {
+//	    l.SetMaxDataSize(64 << 20)
+//	}
+type DataLimiter interface {
+	// SetMaxDataSize sets the most bytes one read may allocate. n <= 0
+	// restores DefaultMaxDataSize. A read over the ceiling fails with an error
+	// wrapping ErrTooLarge before anything is allocated.
+	SetMaxDataSize(n int64)
+}
+
+var _ DataLimiter = (*realNTFS)(nil)
+
+// SetMaxDataSize implements DataLimiter.
+func (r *realNTFS) SetMaxDataSize(n int64) {
+	if n <= 0 {
+		n = 0
+	}
+	r.maxData = n
+}
+
+// dataLimit is the ceiling in force for this volume.
+func (r *realNTFS) dataLimit() int64 {
+	if r.maxData > 0 {
+		return r.maxData
+	}
+	return maxDataSize
 }
 
 var (
@@ -736,6 +796,74 @@ func decodeUTF16(b []byte) string {
 // readRuns reads logical bytes [0,size) from a runlist. Sparse runs
 // yield zeroes. Clusters are read relative to partOffset.
 func (r *realNTFS) readRuns(runs []dataRun, size uint64) ([]byte, error) {
+	return r.readRunsOpt(runs, size, true)
+}
+
+// backed reports whether the n bytes at absolute offset abs exist in the
+// image. It reads the last one: the image either has it or the run is lying,
+// and it costs one ReadAt whatever the size of the run. A reader that reports
+// (0, nil) or io.EOF for a position past its end both fail the test, because
+// the byte did not arrive.
+func (r *realNTFS) backed(abs, n int64) bool {
+	if n <= 0 {
+		return true
+	}
+	last, ok := addCheck(abs, n-1)
+	if !ok {
+		return false
+	}
+	var b [1]byte
+	m, _ := r.f.ReadAt(b[:], last)
+	return m == 1
+}
+
+// checkRunsBacked is the structural bound on a read of want bytes from runs:
+// every allocated (non-sparse) span that the read touches must lie inside the
+// image, so the buffer is never bigger than bytes the image holds plus the
+// sparse holes, and a sparse hole is refused outright unless allowSparse. It
+// runs before the buffer is allocated.
+func (r *realNTFS) checkRunsBacked(runs []dataRun, want int64, allowSparse bool) error {
+	cs := r.boot.clusterSize()
+	var pos int64
+	for _, run := range runs {
+		if pos >= want {
+			break
+		}
+		runBytes, ok := mulCheck(run.lengthClusters, cs)
+		if !ok {
+			return fmt.Errorf("ntfs: run byte count overflow")
+		}
+		span := runBytes
+		if span > want-pos {
+			span = want - pos
+		}
+		if run.sparse {
+			if !allowSparse {
+				return fmt.Errorf("ntfs: sparse run in an attribute that cannot have holes")
+			}
+			pos += span
+			continue
+		}
+		base, ok := mulCheck(run.startCluster, cs)
+		if !ok {
+			return fmt.Errorf("ntfs: run start overflow")
+		}
+		abs, ok := addCheck(base, r.partOffset)
+		if !ok || abs < 0 {
+			return fmt.Errorf("ntfs: run absolute offset overflow")
+		}
+		if !r.backed(abs, span) {
+			return fmt.Errorf("ntfs: run of %d bytes at cluster %d lies past the end of the image", span, run.startCluster)
+		}
+		pos += span
+	}
+	return nil
+}
+
+// readRunsOpt is readRuns with the sparse policy chosen by the caller:
+// $DATA may have holes, the metadata attributes (index allocation, attribute
+// list, reparse point ...) may not.
+func (r *realNTFS) readRunsOpt(runs []dataRun, size uint64, allowSparse bool) ([]byte, error) {
 	cs := r.boot.clusterSize()
 	// H1: bound the requested logical size by both the total capacity the
 	// runlist can actually back AND an absolute ceiling, so an attacker's
@@ -761,7 +889,13 @@ func (r *realNTFS) readRuns(runs []dataRun, size uint64) ([]byte, error) {
 	if want > capBytes {
 		want = capBytes
 	}
-	out, err := safeio.MakeBytes(want, maxDataSize)
+	if want > r.dataLimit() {
+		return nil, fmt.Errorf("ntfs: data buffer: %w: size %d exceeds ceiling %d", safeio.ErrTooLarge, want, r.dataLimit())
+	}
+	if err := r.checkRunsBacked(runs, want, allowSparse); err != nil {
+		return nil, err
+	}
+	out, err := safeio.MakeBytes(want, r.dataLimit())
 	if err != nil {
 		return nil, fmt.Errorf("ntfs: data buffer: %w", err)
 	}
@@ -819,7 +953,10 @@ func (r *realNTFS) readAttrData(a *attribute) ([]byte, error) {
 	if a.isCompressed() {
 		return r.readCompressedRuns(a.runs, a.realSize, a.compUnit)
 	}
-	return r.readRuns(a.runs, a.realSize)
+	// Only $DATA may have holes. A sparse $INDEX_ALLOCATION, $ATTRIBUTE_LIST or
+	// $REPARSE_POINT is meaningless, and materialising it would turn a few bytes
+	// of runlist into a buffer of zeros.
+	return r.readRunsOpt(a.runs, a.realSize, a.typeCode == attrData)
 }
 
 // attrBytes returns the content of the first unnamed attribute with the
@@ -931,7 +1068,7 @@ func (r *realNTFS) listDirRecord(fr *fileRecord) ([]indexEntry, error) {
 			continue
 		}
 		a := &fr.attrs[i]
-		raw, err := r.readRuns(a.runs, a.realSize)
+		raw, err := r.readRunsOpt(a.runs, a.realSize, false)
 		if err != nil {
 			return entries, err
 		}
@@ -984,11 +1121,17 @@ func parseIndexEntries(buf []byte, firstOff int) ([]indexEntry, error) {
 		if flags&indexEntryLast != 0 {
 			break
 		}
-		if entryLen <= 0 || off+entryLen > len(buf) {
+		// An entry is at least its 0x10-byte header and ends inside the
+		// buffer, and its key lies inside it (Linux ntfs3 hdr_find_e:
+		// "e_size < sizeof(struct NTFS_DE) || off + e_size > end" and
+		// "e_key_len > e->size - sizeof(struct NTFS_DE)"). Without that, a
+		// 1..15-byte entryLen walks the buffer almost byte by byte and every
+		// step decodes an overlapping key: input-sized work, output ~160x larger.
+		if entryLen < 0x10 || off+entryLen > len(buf) {
 			break
 		}
 		// The key is a $FILE_NAME structure starting at off+0x10.
-		if keyLen >= 0x42 && off+0x10+keyLen <= len(buf) {
+		if keyLen >= 0x42 && keyLen <= entryLen-0x10 {
 			fn, err := parseFileName(buf[off+0x10 : off+0x10+keyLen])
 			if err == nil {
 				// FILE_NAME flags at +0x38 hold the FILE_ATTRIBUTE bits;

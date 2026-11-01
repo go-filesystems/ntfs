@@ -661,9 +661,11 @@ func TestFeature_CompressedReadErrors(t *testing.T) {
 	if !bytes.Equal(b, make([]byte, unit*tClusterSize)) {
 		t.Fatal("sparse-only unit should be all zeros")
 	}
-	// Runlist shorter than declared size: the tail stays zero (loop breaks).
+	// Runlist shorter than declared size: the output is what the runlist
+	// describes (here nothing), not what realSize claims -- the same rule
+	// readRuns follows, so a few bytes of attribute cannot size a buffer.
 	b, err = r.readCompressedRuns(nil, uint64(unit*tClusterSize), 2)
-	if err != nil || !bytes.Equal(b, make([]byte, unit*tClusterSize)) {
+	if err != nil || len(b) != 0 {
 		t.Fatalf("empty runlist: b=%d err=%v", len(b), err)
 	}
 }

@@ -59,7 +59,8 @@ func TestWB_ReadCompressedRuns_Errors(t *testing.T) {
 		t.Fatal("expected size-too-large error")
 	}
 	// size beyond the maxDataSize ceiling (buffer allocation refused).
-	if _, err := r.readCompressedRuns(nil, uint64(maxDataSize)+1, 2); err == nil {
+	over := []dataRun{{lengthClusters: maxDataSize/tClusterSize + 1, sparse: true, startCluster: -1}}
+	if _, err := r.readCompressedRuns(over, uint64(maxDataSize)+1, 2); err == nil {
 		t.Fatal("expected data-buffer error")
 	}
 	// A unit whose allocated cluster read overflows (start cluster near max).

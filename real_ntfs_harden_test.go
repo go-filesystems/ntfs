@@ -408,11 +408,17 @@ func FuzzRealNTFS(f *testing.F) {
 		// Drive the read surface; every method must return rather than
 		// panic. We ignore the (error) results: correctness here means
 		// "did not crash".
+		// A sparse $DATA may legitimately read back as zeros far bigger than
+		// the image: ceiling it so one execution cannot take a gigabyte.
+		r.SetMaxDataSize(8 << 20)
 		_, _ = r.ReadFile("/")
 		_, _ = r.ReadFile("/hello.txt")
 		_, _ = r.ListDir("/")
 		_, _ = r.ListDir("/dir")
 		_, _ = r.Stat("/")
+		_, _ = r.ReadLink("/hello.txt")
+		_, _ = r.ListStreams("/hello.txt")
+		_, _ = r.ReadStream("/hello.txt", "")
 		_ = r.Label()
 	})
 }
