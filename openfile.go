@@ -68,8 +68,8 @@ func (f *flatFile) ReadAt(p []byte, off int64) (int, error) {
 
 // OpenFile opens the unnamed $DATA of the file at p for positional reads. A
 // resident or plain non-resident stream is read by range (holes as zeros); a
-// compressed one (LZNT1) is decompressed whole, once, on the first read, within
-// the volume's data ceiling (SetMaxDataSize); an encrypted one is refused.
+// compressed one (LZNT1) is decoded unit by unit (at most 64 KiB each), only the
+// units a read touches; an encrypted one is refused.
 func (r *realNTFS) OpenFile(p string) (filesystem.File, error) {
 	_, fr, err := r.resolvePath(p)
 	if err != nil {
@@ -95,12 +95,7 @@ func (r *realNTFS) openAttr(a *attribute) (filesystem.File, error) {
 		return nil, fmt.Errorf("ntfs: encrypted ($EFS) data is not decodable without keys")
 	}
 	if a.isCompressed() {
-		if a.realSize > 1<<62 {
-			return nil, fmt.Errorf("ntfs: data size %d too large", a.realSize)
-		}
-		return &lazyFile{size: int64(a.realSize), load: func() ([]byte, error) {
-			return r.readCompressedRuns(a.runs, a.realSize, a.compUnit)
-		}}, nil
+		return r.openCompressed(a)
 	}
 	cs := r.boot.clusterSize()
 	rf := &runsFile{r: r, runs: a.runs, cs: cs, starts: make([]int64, len(a.runs)+1)}
@@ -146,28 +141,116 @@ func (f *flatBytes) ReadAt(p []byte, off int64) (int, error) {
 	return n, nil
 }
 
-// lazyFile is a stream that can only be had whole (compressed): it is loaded
-// once, on the first read.
-type lazyFile struct {
-	size int64
-	load func() ([]byte, error)
-	once sync.Once
-	data *flatBytes
-	err  error
+// openCompressed opens an LZNT1-compressed stream. It is read by range: only the
+// compression units (at most maxCompUnitBytes each) that the window touches are
+// read and decoded, so what a read allocates is bounded by its window, never by
+// the declared size of the file.
+func (r *realNTFS) openCompressed(a *attribute) (filesystem.File, error) {
+	compUnit := a.compUnit
+	if compUnit == 0 || compUnit > 30 {
+		return nil, fmt.Errorf("ntfs: invalid compression unit exponent %d", compUnit)
+	}
+	cs := r.boot.clusterSize()
+	unitClusters := int64(1) << compUnit
+	unitBytes, ok := mulCheck(unitClusters, cs)
+	if !ok || unitBytes <= 0 || unitBytes > maxCompUnitBytes {
+		return nil, fmt.Errorf("ntfs: compression unit of %d clusters of %d bytes is refused (at most %d bytes)", unitClusters, cs, maxCompUnitBytes)
+	}
+	if a.realSize > 1<<62 {
+		return nil, fmt.Errorf("ntfs: data size %d too large", a.realSize)
+	}
+	f := &compFile{r: r, runs: a.runs, unitClusters: unitClusters, unitBytes: unitBytes,
+		starts: make([]int64, len(a.runs)+1)}
+	var capBytes int64
+	for i, run := range a.runs {
+		rb, ok := mulCheck(run.lengthClusters, cs)
+		if !ok {
+			return nil, fmt.Errorf("ntfs: run capacity overflow")
+		}
+		if capBytes, ok = addCheck(capBytes, rb); !ok {
+			return nil, fmt.Errorf("ntfs: run capacity overflow")
+		}
+		f.starts[i+1] = f.starts[i] + run.lengthClusters
+	}
+	f.size = int64(a.realSize)
+	if f.size > capBytes {
+		f.size = capBytes
+	}
+	return f, nil
 }
 
-func (f *lazyFile) Size() int64  { return f.size }
-func (f *lazyFile) Close() error { return nil }
+// compFile is a compressed non-resident stream read unit by unit.
+type compFile struct {
+	r            *realNTFS
+	runs         []dataRun
+	starts       []int64 // starts[i] is the first cluster of runs[i]; the last is the total
+	unitClusters int64
+	unitBytes    int64
+	size         int64
 
-func (f *lazyFile) ReadAt(p []byte, off int64) (int, error) {
-	f.once.Do(func() {
-		b, err := f.load()
-		f.data, f.err = &flatBytes{b: b}, err
-	})
+	once sync.Once
+	err  error // the allocated spans must lie inside the image, checked on the first read
+}
+
+func (f *compFile) Size() int64  { return f.size }
+func (f *compFile) Close() error { return nil }
+
+// unit decodes compression unit u into a fresh unitBytes buffer.
+func (f *compFile) unit(u int64) ([]byte, error) {
+	out := make([]byte, f.unitBytes)
+	first := u * f.unitClusters
+	i := sort.Search(len(f.runs), func(i int) bool { return f.starts[i+1] > first })
+	rr := &runReader{r: f.r, runs: f.runs, ri: i}
+	if i < len(f.runs) {
+		rr.consumed = first - f.starts[i]
+	}
+	raw, allocated, sawSparse, err := rr.readUnit(f.unitClusters)
+	if err != nil {
+		return nil, err
+	}
+	switch {
+	case allocated == 0:
+		// A hole, or the runlist is exhausted: zeros.
+	case !sawSparse:
+		copy(out, raw)
+	default:
+		dec, err := lznt1Decompress(raw, int(f.unitBytes))
+		if err != nil {
+			return nil, fmt.Errorf("ntfs: lznt1: %w", err)
+		}
+		copy(out, dec)
+	}
+	return out, nil
+}
+
+func (f *compFile) ReadAt(p []byte, off int64) (int, error) {
+	if off < 0 {
+		return 0, fmt.Errorf("ntfs: negative offset %d", off)
+	}
+	if off >= f.size {
+		return 0, io.EOF
+	}
+	f.once.Do(func() { f.err = f.r.checkRunsBacked(f.runs, f.size, true) })
 	if f.err != nil {
 		return 0, f.err
 	}
-	return f.data.ReadAt(p, off)
+	want := int64(len(p))
+	if off+want > f.size {
+		want = f.size - off
+	}
+	hi := off + want
+	for u := off / f.unitBytes; u*f.unitBytes < hi; u++ {
+		data, err := f.unit(u)
+		if err != nil {
+			return 0, err
+		}
+		lo, top := max(u*f.unitBytes, off), min((u+1)*f.unitBytes, hi)
+		copy(p[lo-off:top-off], data[lo-u*f.unitBytes:top-u*f.unitBytes])
+	}
+	if want < int64(len(p)) {
+		return int(want), io.EOF
+	}
+	return int(want), nil
 }
 
 // runsFile is a non-resident stream read by range over its runlist.
