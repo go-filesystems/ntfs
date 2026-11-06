@@ -29,7 +29,7 @@ legacy read/write code path.
 |---|---:|---|
 | Open / Close | ✅ | Minimal in-image implementation |
 | ReadFile / WriteFile | ✅ | Blob storage model inside image |
-| OpenFile (`filesystem.Opener`), both readers | ✅ | Positional reads. This package's own format: one contiguous extent. A real NTFS volume: a resident stream from memory, a plain non-resident one by range over its runlist (holes as zeros, each touched run checked to lie inside the image); a compressed (LZNT1) one is decompressed whole, once, on the first read, within `SetMaxDataSize`; an encrypted one is refused. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
+| OpenFile (`filesystem.Opener`), both readers | ✅ | Positional reads. This package's own format: one contiguous extent. A real NTFS volume: a resident stream from memory, a plain non-resident one by range over its runlist (holes as zeros, each touched run checked to lie inside the image); a compressed (LZNT1) one is read unit by unit (at most 64 KiB each), only the units the window touches, so a read allocates by its window and never by the declared size; an encrypted one is refused. A 1 MiB read at 66 MiB of a 72 MiB file allocates nothing through it and 75.5 MB through `ReadFile` |
 | MkDir / Delete / Rename | ✅ | Implemented (recursive delete supported) |
 | Symlink (create) | ✅ | NTFSIMG1 in-image driver |
 | ReadLink (read target) | ✅ | NTFSIMG1 metadata |
