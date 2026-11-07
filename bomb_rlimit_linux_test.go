@@ -25,7 +25,13 @@ import (
 
 const bombChildEnv = "NTFS_BOMB_CHILD"
 
-const bombAddressSpace = 1 << 30 // 1 GiB of address space for the whole child
+// 2 GiB of address space for the whole child: the Go runtime on arm64 (64 KiB
+// pages) does not start a window read under 1 GiB, and the bombs are 1 TiB.
+const bombAddressSpace = 2 << 30
+
+// bombLimitNotEnforced is the child's exit code when the limit was accepted but
+// not applied (QEMU user-mode emulation ignores setrlimit): the parent skips.
+const bombLimitNotEnforced = 77
 
 func TestBomb_UnderAddressSpaceLimit(t *testing.T) {
 	if os.Getenv(bombChildEnv) == "1" {
@@ -43,6 +49,10 @@ func TestBomb_UnderAddressSpaceLimit(t *testing.T) {
 	cmd := exec.Command(bin, "-test.run=^TestBomb_UnderAddressSpaceLimit$", "-test.v")
 	cmd.Env = append(os.Environ(), bombChildEnv+"=1", "GOMEMLIMIT=256MiB")
 	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if errors.As(err, &ee) && ee.ExitCode() == bombLimitNotEnforced {
+		t.Skipf("this kernel or emulator does not apply RLIMIT_AS (QEMU user mode ignores it): %s", out)
+	}
 	if err != nil {
 		t.Fatalf("the child did not exit cleanly under RLIMIT_AS=%d (an out-of-memory crash, or a bomb that was not refused): %v\n%s", bombAddressSpace, err, out)
 	}
@@ -64,7 +74,8 @@ func bombChild() {
 	}
 	var got syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_AS, &got); err != nil || got.Cur != bombAddressSpace {
-		fail("the limit did not stick: %v %+v", err, got)
+		fmt.Fprintf(os.Stderr, "bomb: the limit did not stick: %v %+v\n", err, got)
+		os.Exit(bombLimitNotEnforced)
 	}
 	fmt.Println("bomb: limit set")
 
