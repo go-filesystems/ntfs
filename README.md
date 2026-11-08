@@ -51,6 +51,7 @@ legacy read/write code path.
 | Symlinks / junctions | ✅ | `$REPARSE_POINT` (`IO_REPARSE_TAG_SYMLINK` / `IO_REPARSE_TAG_MOUNT_POINT`) and ntfs-3g `IntxLNK`; `ReadLink` |
 | `$ATTRIBUTE_LIST` (spanning records) | ✅ | Extension records stitched; split runlists merged by VCN |
 | Volume label | ✅ | `Label` reads `$VOLUME_NAME` |
+| Timestamps | ✅ | `filesystem.TimesReader`: creation, modification, MFT-change and access as 100 ns FILETIMEs (UTC) from `$STANDARD_INFORMATION`, `$FILE_NAME` only as fallback; 0 / out-of-range stays unrecorded. Not on the NTFSIMG1 mock |
 | Write path | ⚠️ No | Read-only reader; mutating methods return an error |
 | EFS-encrypted data | ⚠️ No | Not decodable without the user's keys (clear error) |
 
