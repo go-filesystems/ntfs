@@ -63,8 +63,10 @@ jobs:
       # a custom NTFSIMG1 container rather than real NTFS, so ntfsfix and
       # ntfsls reject it -- an accurate statement of a known limit, not a stale
       # gate.
+      # `attr` provides setfattr, which TestInterop_Compression_Gold uses to
+      # mark a directory compressed; the runner image no longer carries it.
       - name: ntfs-3g, the reference formatter for the read side
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq ntfs-3g
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq ntfs-3g attr
 
       - name: Build
         working-directory: ntfs
