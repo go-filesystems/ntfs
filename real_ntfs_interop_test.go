@@ -54,6 +54,21 @@ func requireNtfs3g(t *testing.T) ntfs3gEnv {
 	return e
 }
 
+// requireHostTool checks that a host program is installed. In a lane that sets
+// NTFS_REQUIRE_PROGS (the CI lane meant to run these tests) a missing tool is a
+// hard failure naming the apt package; elsewhere the test skips with that
+// reason, since a missing host tool is not a defect of this package.
+func requireHostTool(t *testing.T, tool, pkg string) {
+	t.Helper()
+	if _, err := exec.LookPath(tool); err == nil {
+		return
+	}
+	if os.Getenv("NTFS_REQUIRE_PROGS") != "" {
+		t.Fatalf("NTFS_REQUIRE_PROGS is set but %q is not installed (apt package %q)", tool, pkg)
+	}
+	t.Skipf("%s not installed (apt package %s); skipping", tool, pkg)
+}
+
 // sh runs a command, failing the test on error with combined output.
 func sh(t *testing.T, name string, args ...string) string {
 	t.Helper()
@@ -122,6 +137,7 @@ func TestInterop_Compression_Gold(t *testing.T) {
 		cdir := filepath.Join(mnt, "cdir")
 		sh(t, "mkdir", "-p", cdir)
 		// Mark the directory compressed so ntfs-3g compresses files inside it.
+		requireHostTool(t, "setfattr", "attr")
 		sh(t, "setfattr", "-h", "-n", "system.ntfs_attrib_be", "-v", "0x00000800", cdir)
 		if err := os.WriteFile(filepath.Join(cdir, "comp.txt"), payload, 0o644); err != nil {
 			t.Fatal(err)
